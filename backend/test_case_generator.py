@@ -1179,6 +1179,140 @@ def generate_for_chunk(
             # Build expected outcome
             expected = EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
 
+            # ── Sequence output transitions ──────────────────────────────────
+            # Embed an explicit output signal value so the Excel output signal
+            # column shows the logically correct value for each scenario:
+            #   normal / boundary → True  (positive path, conditions met)
+            #   edge / robustness → False (negative/fault path)
+            #
+            # Detection order (first match wins):
+            #  1. "shall set <Signal> to True/Enabled/Active/1"   (positive form)
+            #  2. "shall set <Signal> to False/Disabled/Inactive/0" (negative form → invert)
+            #  3. "<Signal> shall be set to True/..."              (passive form)
+            #  4. "<Signal> = True/..."                            (assignment form)
+            #  5. "<Signal> is True/..."                           (state form)
+            _BOOL_VALS_TRUE  = r'(True|Enabled|Active|1)'
+            _BOOL_VALS_FALSE = r'(False|Disabled|Inactive|0)'
+            _BOOL_VALS_ANY   = r'(True|False|Enabled|Disabled|Active|Inactive|1|0)'
+
+            _sig_name  = None
+            _true_val  = None   # the "positive" value for this signal
+            _false_val = None   # the "negative" value for this signal
+
+            # Pattern 1 — positive: "shall set <Signal> to True/Enabled/Active/1"
+            _QUOTE_OPT = '[\"\']?'
+            _m = re.search(
+                r"(?:shall|must|will)\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+"
+                + _QUOTE_OPT + _BOOL_VALS_TRUE + _QUOTE_OPT,
+                sentence, re.IGNORECASE
+            )
+            if _m:
+                _sig_name = _m.group(1).strip().rstrip("'")
+                _true_val = _m.group(2)
+
+            # Pattern 2 — negative form: "shall set <Signal> to False/Disabled/..."
+            # This means the signal's TRUE value is the opposite (for normal scenario)
+            if not _sig_name:
+                _m = re.search(
+                    r"(?:shall|must|will)\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+"
+                    + _QUOTE_OPT + _BOOL_VALS_FALSE + _QUOTE_OPT,
+                    sentence, re.IGNORECASE
+                )
+                if _m:
+                    _sig_name = _m.group(1).strip().rstrip("'")
+                    _negative = _m.group(2)   # e.g. "False"
+                    # The "positive" (normal/boundary) value is the inverse
+                    _true_val = (
+                        "True"   if _negative.lower() in ("false", "0")      else
+                        "Enabled"  if _negative.lower() == "disabled"          else
+                        "Active"   if _negative.lower() == "inactive"          else
+                        "True"
+                    )
+                    _false_val = _negative    # already the false value
+
+            # Pattern 3 — passive: "<Signal> shall be set to <BoolVal>"
+            if not _sig_name:
+                _m = re.search(
+                    r"([\w\s]{3,50}?)\s+(?:shall|must|will|should)\s+be\s+set\s+to\s+"
+                    + _QUOTE_OPT + _BOOL_VALS_ANY + _QUOTE_OPT,
+                    sentence, re.IGNORECASE
+                )
+                if _m:
+                    _cand = _m.group(1).strip().rstrip("'")
+                    _val  = _m.group(2)
+                    # Only use if candidate looks like a signal name (≤8 words)
+                    if 1 <= len(_cand.split()) <= 8:
+                        _sig_name = _cand
+                        _true_val = (
+                            _val if _val.lower() in ("true","enabled","active","1")
+                            else (
+                                "True"    if _val.lower() in ("false","0")      else
+                                "Enabled" if _val.lower() == "disabled"          else
+                                "Active"  if _val.lower() == "inactive"          else
+                                "True"
+                            )
+                        )
+
+            # Pattern 4 — assignment: "<Signal> = <BoolVal>"
+            if not _sig_name:
+                _m = re.search(
+                    r"([A-Z][\w\s]{2,50}?)\s*=\s*" + _BOOL_VALS_ANY + r"\b",
+                    sentence
+                )
+                if _m:
+                    _cand = _m.group(1).strip()
+                    _val  = _m.group(2)
+                    if 1 <= len(_cand.split()) <= 8:
+                        _sig_name = _cand
+                        _true_val = (
+                            _val if _val.lower() in ("true","enabled","active","1")
+                            else (
+                                "True"    if _val.lower() in ("false","0")      else
+                                "Enabled" if _val.lower() == "disabled"          else
+                                "Active"  if _val.lower() == "inactive"          else
+                                "True"
+                            )
+                        )
+
+            # Pattern 5 — state: "<Signal> is <BoolVal>"
+            if not _sig_name:
+                _m = re.search(
+                    r"([A-Z][\w\s]{2,50}?)\s+is\s+"
+                    + _QUOTE_OPT + _BOOL_VALS_ANY + _QUOTE_OPT + r"\b",
+                    sentence
+                )
+                if _m:
+                    _cand = _m.group(1).strip()
+                    _val  = _m.group(2)
+                    if 1 <= len(_cand.split()) <= 8:
+                        _sig_name = _cand
+                        _true_val = (
+                            _val if _val.lower() in ("true","enabled","active","1")
+                            else (
+                                "True"    if _val.lower() in ("false","0")      else
+                                "Enabled" if _val.lower() == "disabled"          else
+                                "Active"  if _val.lower() == "inactive"          else
+                                "True"
+                            )
+                        )
+
+            if _sig_name and _true_val:
+                if _false_val is None:
+                    _false_val = (
+                        "False"    if _true_val.lower() in ("true","1")        else
+                        "Disabled" if _true_val.lower() == "enabled"           else
+                        "Inactive" if _true_val.lower() == "active"            else
+                        "False"
+                    )
+                # Apply the logical value for this scenario type
+                _seq_value = (
+                    _true_val  if scenario_type in ("normal", "boundary") else
+                    _false_val   # edge / robustness → output is False / negative
+                )
+                # Prepend "SignalName = Value." so _get_signal_value() in
+                # output_generator.py picks it up for the Excel output column.
+                expected = f"{_sig_name} = {_seq_value}. " + expected
+
             # Generate remarks per scenario (Req 8 — scenario-type-specific)
             remarks = (
                 generate_remarks(sentence, primary_req_id, notes_ctx, scenario_type, input_source)
@@ -1454,6 +1588,58 @@ def _generate_merged_tcs(
             remarks_text += generate_remarks(parent_content, parent_id,
                                              scenario_type=scenario_type)
 
+        # Build expected outcome with output signal transition for merged TC
+        _merged_base_exp = (
+            EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
+            + f" All sub-requirements ({', '.join(child_ids)}) "
+            f"are satisfied within this single test."
+        )
+        # Detect output signal from parent requirement using the same multi-pattern
+        # approach as the per-sentence path (positive, negative, passive, assign, state)
+        _mQUOTE = '["\'\u2018\u2019\u201c\u201d]?'
+        _mBOOL_T = r'(True|Enabled|Active|1)'
+        _mBOOL_F = r'(False|Disabled|Inactive|0)'
+        _mBOOL_A = r'(True|False|Enabled|Disabled|Active|Inactive|1|0)'
+        _msig = None; _mtv = None; _mfv = None
+        for _mpat, _mpositive in [
+            (r"(?:shall|must|will)\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+" + _mQUOTE + _mBOOL_T + _mQUOTE, True),
+            (r"(?:shall|must|will)\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+" + _mQUOTE + _mBOOL_F + _mQUOTE, False),
+            (r"([\w\s]{3,50}?)\s+(?:shall|must|will|should)\s+be\s+set\s+to\s+" + _mQUOTE + _mBOOL_A + _mQUOTE, None),
+            (r"([A-Z][\w\s]{2,50}?)\s*=\s*" + _mBOOL_A + r"\b", None),
+            (r"([A-Z][\w\s]{2,50}?)\s+is\s+" + _mQUOTE + _mBOOL_A + _mQUOTE + r"\b", None),
+        ]:
+            _mm = re.search(_mpat, parent_content, re.IGNORECASE)
+            if _mm:
+                _mcand = _mm.group(1).strip().rstrip("'")
+                _mval  = _mm.group(2)
+                if 1 <= len(_mcand.split()) <= 8:
+                    _msig = _mcand
+                    if _mpositive is True:
+                        _mtv = _mval
+                    elif _mpositive is False:
+                        _mfv = _mval
+                        _mtv = ("True" if _mval.lower() in ("false","0") else
+                                "Enabled" if _mval.lower() == "disabled" else
+                                "Active"  if _mval.lower() == "inactive" else "True")
+                    else:
+                        if _mval.lower() in ("true","enabled","active","1"):
+                            _mtv = _mval
+                        else:
+                            _mfv = _mval
+                            _mtv = ("True" if _mval.lower() in ("false","0") else
+                                    "Enabled" if _mval.lower() == "disabled" else
+                                    "Active"  if _mval.lower() == "inactive" else "True")
+                    break
+        if _msig and _mtv:
+            if _mfv is None:
+                _mfv = ("False"    if _mtv.lower() in ("true","1")   else
+                        "Disabled" if _mtv.lower() == "enabled"       else
+                        "Inactive" if _mtv.lower() == "active"        else "False")
+            _msv = _mtv if scenario_type in ("normal", "boundary") else _mfv
+            _merged_expected = f"{_msig} = {_msv}. " + _merged_base_exp
+        else:
+            _merged_expected = _merged_base_exp
+
         results.append(TestCase(
             traceability_req_id  = combined_id,
             test_case_id         = tc_id,
@@ -1472,11 +1658,7 @@ def _generate_merged_tcs(
             inputs               = inputs,
             design_methodology   = assign_methodology(parent_content, scenario_type),
             dependent_test_cases = "None",
-            expected_outcome     = (
-                EXPECTED_OUTCOME_TEMPLATES[scenario_type].format(action=action_fmt)
-                + f" All sub-requirements ({', '.join(child_ids)}) "
-                f"are satisfied within this single test."
-            ),
+            expected_outcome     = _merged_expected,
             test_environment     = env,
             remarks              = remarks_text,
             module               = parent_chunk.module,

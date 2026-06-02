@@ -52,51 +52,19 @@ function colE(tc) {
   return listToStr(tc.preconditions)
 }
 
-// Col F: Test Precondition = Test Objective + preset values + input-related steps + preconditions
+// Col F: Test Precondition = preconditions only (mirrors _col_f_precondition in output_generator.py)
 function colF(tc) {
-  const parts = []
-
-  // Test Objective
-  parts.push(`Test Objective:\n${tc.objective}`)
-
-  // Pre-set input values detected in objective + preconditions
-  const searchText = tc.objective + ' ' + listToStr(tc.preconditions)
-  const presets = [...searchText.matchAll(
-    /(?:is|=|equals?|set\s+to)\s+(True|False|Active|Inactive|\d+(?:\.\d+)?)/gi
-  )].map(m => m[1])
-  if (presets.length) {
-    parts.push(
-      `Pre-set input values (from requirement): ${presets.join(', ')}\n` +
-      `Output is generated when ALL specified input conditions are met. ` +
-      `Any change in the above inputs will directly influence the output.`
-    )
-  }
-
-  // Input-related test steps
-  const inputNames = new Set(
-    (tc.inputs || []).map(e => parseSignalValue(e)[0].toLowerCase())
-  )
-  const keywords = ['input', 'prepare', 'set ', 'boundary', 'valid', 'value']
-  const matchedSteps = (tc.test_steps || []).filter(step => {
-    const sl = step.toLowerCase()
-    return [...inputNames].some(n => sl.includes(n)) ||
-           keywords.some(kw => sl.includes(kw))
-  })
-  if (matchedSteps.length) {
-    parts.push(`Test Steps (input-related):\n${matchedSteps.join('\n')}`)
-  }
-
-  // Standard preconditions
-  if (tc.preconditions && tc.preconditions.length) {
-    parts.push(`Preconditions:\n${listToStr(tc.preconditions)}`)
-  }
-
-  return parts.join('\n\n')
+  if (!tc.preconditions || !tc.preconditions.length) return ''
+  return listToStr(tc.preconditions)
 }
 
-// Col I: Expected Outputs = raw expected_outcome string
+// Col I: Expected Outputs = first sentence of expected_outcome only
+// (mirrors _write_tc_row: first_s = tc.expected_outcome.split('.')[0].strip())
 function colI(tc) {
-  return tc.expected_outcome || ''
+  const raw = tc.expected_outcome || ''
+  if (!raw) return ''
+  const firstSentence = raw.split('.')[0].trim()
+  return firstSentence
 }
 
 // Col J: Depands On

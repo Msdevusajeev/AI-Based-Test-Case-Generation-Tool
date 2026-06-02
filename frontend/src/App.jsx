@@ -24,6 +24,46 @@ function ExportButton({ label, href, disabled, color }) {
   )
 }
 
+function ClaudeModal({ chunks, onOk }) {
+  const [checked, setChecked] = useState(false)
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-surface border border-border rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6">
+        <p className="text-text text-sm font-semibold mb-3">
+          {chunks} requirement(s) queued for Claude AI!
+        </p>
+        <p className="text-dim text-sm mb-1 font-medium">Steps:</p>
+        <ol className="text-dim text-sm space-y-1 mb-5 list-decimal list-inside">
+          <li>Open Claude Desktop</li>
+          <li>Start a New Chat</li>
+          <li>Press Ctrl+V to paste</li>
+          <li>Press Enter</li>
+        </ol>
+        <p className="text-dim text-xs mb-5">
+          Results will appear here automatically when Claude finishes.
+        </p>
+        <label className="flex items-center gap-2 cursor-pointer mb-5 select-none">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={e => setChecked(e.target.checked)}
+            className="w-4 h-4 accent-amber cursor-pointer"
+          />
+          <span className="text-dim text-sm">Don't ask me again</span>
+        </label>
+        <div className="flex justify-end">
+          <button
+            onClick={() => onOk(checked)}
+            className="px-6 py-2 rounded-xl bg-blue-500 hover:bg-blue-400 text-white text-sm font-semibold transition-all"
+          >
+            OK
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [uploadData,   setUploadData]   = useState(null)
   const [reviewPoints, setReviewPoints] = useState(DEFAULT_RP)
@@ -39,6 +79,11 @@ export default function App() {
   const [mcpResults,   setMcpResults]   = useState(null)
   const [aiWaiting,    setAiWaiting]    = useState(false)
   const [exportSource, setExportSource] = useState('session') // 'session' | 'mcp'
+
+  // ── Claude AI instructions modal state ───────────────────────────────────
+  const [showModal,    setShowModal]    = useState(false)
+  const [modalChunks,  setModalChunks]  = useState(0)
+  const [dontAskAgain, setDontAskAgain] = useState(() => localStorage.getItem('claudeModalDismissed') === 'true')
 
   // ── Fetch engine mode on startup ─────────────────────────────────────────
   useEffect(() => {
@@ -105,53 +150,89 @@ export default function App() {
     }
   }
 
-  // ── Claude Desktop AI generation ──────────────────────────────────────────
+  // ── Claude AI generation (Claude Desktop via MCP) ────────────────────────
+  // This handler is EXCLUSIVELY for the "Generate Test Cases using Claude AI"
+  // button. It calls /api/generate/ai which queues requirement chunks for
+  // Claude Desktop — the rule-based engine is never invoked here.
   const handleClaudeGenerate = async () => {
     if (!uploadData?.session_id) return
     setError('')
-    try {
-      const chunkRes  = await fetch(`/api/debug/chunks?session_id=${uploadData.session_id}`)
-      const chunkData = await chunkRes.json()
-      const chunks    = chunkData.chunks || []
+    setTestCases([])
+    setSummary(null)
 
-      if (chunks.length === 0) {
-        setError('No requirements found. Try rule-based Generate first.')
+    try {
+      // Queue the document for Claude AI via the dedicated AI endpoint
+      const queueRes = await fetch('/api/generate/ai', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          session_id:            uploadData.session_id,
+          icd_session_id:        uploadData.icd_session_id        || null,
+          supporting_session_id: uploadData.supporting_session_id || null,
+        }),
+      })
+      const queueData = await queueRes.json()
+      if (!queueRes.ok) {
+        setError(queueData?.detail?.suggestion || queueData?.detail || 'Failed to queue for Claude AI')
         return
       }
 
-      await fetch('/api/ai/queue', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ chunks, session_id: uploadData.session_id }),
-      })
+      const totalChunks = queueData.total_chunks ?? 0
+      if (totalChunks === 0) {
+        setError('No requirements found in the document.')
+        return
+      }
 
+      // Build the Claude Desktop prompt — instructs Claude to generate test
+      // cases from scratch using the NLP context returned by get_generated_test_cases.
       const prompt = [
-        'Use tc-tool to enhance the test cases for my SRS document.',
+        'Generate test cases for my SRS document using tc-tool.',
         '',
         'Follow these steps EXACTLY:',
         '',
         'STEP 1: Call tc-tool get_generated_test_cases',
-        'This returns test cases already generated by the rule-based engine.',
-        'The structure and format are already correct.',
+        'This returns NLP-extracted context (sentences, subjects, actions,',
+        'testing types, priorities, and methodologies) for each requirement.',
+        'Use this context as your input — do NOT copy it as output.',
         '',
-        'STEP 2: Improve ONLY the text quality of these fields for each test case:',
-        '  - objective: make it clearer and specific to the requirement',
-        '  - test_steps: ensure each step is clear, actionable, and complete',
-        '  - preconditions: ensure they are specific and testable',
-        '  - expected_outcome: make it precise and measurable',
-        '  - remarks: add risk, compliance, or ambiguity observations',
+        'STEP 2: For each requirement in the context, generate test cases',
+        'covering ALL FOUR scenario types: normal, boundary, edge, robustness.',
+        'Author every field from scratch using the NLP context as your guide:',
+        '  - traceability_req_id : use requirement_id from context exactly',
+        '  - test_case_id        : TC_VD_001 (validation) / TC_IT_001 (integration) / TC_UT_001 (verification); one ID per requirement',
+        '  - scenario_id         : SC_001, SC_002, SC_003, SC_004 — reset per requirement',
+        '  - priority            : use scenario_priorities[scenario_type] from context',
+        '  - module              : use module from context exactly',
+        '  - requirement_type    : use requirement_type from context (functional or non-functional)',
+        '  - scenario_type       : normal | boundary | edge | robustness',
+        '  - testing_type        : use testing_type from context',
+        '  - test_environment    : use test_environment from context',
+        '  - design_methodology  : use scenario_methodologies[scenario_type] from context',
+        '  - dependent_test_cases: "None" for SC_001; "TC_XX_NNN_SC-001" for all others',
+        '  - inputs              : list of realistic test input values for the scenario',
+        '  - objective           : clear, specific — no modal verbs (shall/must/can/will)',
+        '  - preconditions       : list of specific, testable preconditions',
+        '  - test_steps          : list of numbered actionable strings ["1. ...", "2. ..."]',
+        '  - expected_outcome    : MUST start with "ActualSignalName = Value. " using the REAL',
+        '                          output signal name from the requirement (e.g.',
+        '                          "Altitude Alert Condition Enabled = True. System sets output.").',
+        '                          normal/boundary → True/Enabled/Active.',
+        '                          edge/robustness → False/Disabled/Inactive.',
+        '                          NEVER write "Output signal", "output", or any generic placeholder.',
+        '  - inputs              : list of strings in "SignalName: Value" format using the REAL',
+        '                          signal names from the requirement (e.g. "Tail Low Condition: True")',
+        '  - remarks             : risk, compliance, ambiguity, or coverage observations',
         '',
-        'DO NOT change these fields (they must stay exactly as received):',
-        '  test_case_id, scenario_id, traceability_req_id, priority,',
-        '  module, requirement_type, scenario_type, testing_type,',
-        '  test_environment, design_methodology, dependent_test_cases, inputs',
+        'STEP 3: Call tc-tool save_enhanced_test_cases with the complete list.',
         '',
-        'STEP 3: Call tc-tool save_enhanced_test_cases with the complete',
-        'list of ALL test cases (with your text improvements applied).',
-        '',
-        'IMPORTANT: You MUST call save_enhanced_test_cases at the end.',
-        'Do not just show results in chat.',
-        `Total requirements: ${chunks.length}`,
+        'IMPORTANT RULES:',
+        '  - No modal verbs anywhere in objective, test_steps, or expected_outcome',
+        '  - test_steps must be an array of numbered strings: ["1. Do X", "2. Do Y"]',
+        '  - preconditions must be an array of strings',
+        '  - inputs must be an array of strings in "SignalName: Value" format',
+        '  - expected_outcome must start with the real signal name, not a generic placeholder',
+        '  - You MUST call save_enhanced_test_cases — do not just show results in chat',
+        `Total requirements queued: ${totalChunks}`,
       ].join('\n')
 
       try {
@@ -166,15 +247,10 @@ export default function App() {
       }
 
       setAiWaiting(true)
-      alert(
-        `${chunks.length} requirement(s) queued for Claude AI!\n\n` +
-        'Steps:\n' +
-        '1. Open Claude Desktop\n' +
-        '2. Start a New Chat\n' +
-        '3. Press Ctrl+V to paste\n' +
-        '4. Press Enter\n\n' +
-        'Results will appear here automatically when Claude finishes.'
-      )
+      if (!localStorage.getItem('claudeModalDismissed')) {
+        setModalChunks(totalChunks)
+        setShowModal(true)
+      }
     } catch (e) {
       setError('Failed to queue for Claude AI: ' + e.message)
     }
@@ -182,13 +258,13 @@ export default function App() {
 
   const handleRemindClaude = () => {
     const msg = [
-      'IMPORTANT: Call tc-tool save_enhanced_test_cases NOW.',
+      'IMPORTANT: You must call tc-tool save_enhanced_test_cases NOW.',
       '',
-      'Pass the complete list of ALL test cases you improved,',
-      'with every field intact exactly as received from get_generated_test_cases.',
+      'Pass the complete list of ALL test cases you generated,',
+      'with every field populated as instructed.',
       '',
-      'The React UI at localhost:5173 is waiting.',
-      'You MUST call save_enhanced_test_cases — do not just show in chat.',
+      'The React UI at localhost:5173 is waiting for save_enhanced_test_cases.',
+      'Do NOT just show results in chat — you must call the tool.',
     ].join('\n')
 
     navigator.clipboard.writeText(msg).catch(() => {
@@ -211,11 +287,24 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
+  const handleModalOk = (checked) => {
+    if (checked) localStorage.setItem('claudeModalDismissed', 'true')
+    setShowModal(false)
+  }
+
   const sessionId = uploadData?.session_id
   const isMcp     = mode?.mode === 'online'
 
   return (
     <div className="min-h-screen bg-bg text-text font-sans">
+
+      {/* Claude AI Instructions Modal */}
+      {showModal && (
+        <ClaudeModal
+          chunks={modalChunks}
+          onOk={handleModalOk}
+        />
+      )}
 
       {/* Header */}
       <header className="border-b border-border bg-surface sticky top-0 z-50">
@@ -257,7 +346,7 @@ export default function App() {
                 onClick={handleLoadMcpResults}
                 className="px-4 py-2 rounded-xl text-sm font-semibold bg-amber text-bg hover:bg-amber/90 transition-all"
               >
-                Load into Table
+                Load Results
               </button>
               <a href="/api/export/excel/mcp" download
                 className="px-4 py-2 rounded-xl text-sm font-medium border border-green-500/40 text-green-400 bg-green-500/10 hover:bg-green-500/20 transition-all">

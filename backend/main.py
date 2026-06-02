@@ -335,22 +335,7 @@ def generate(request: GenerateRequest):
             "rp5": rp.rp5,
         }
 
-        # Queue chunks for Claude AI (MCP path) if enabled
-        if MCP_ENABLED:
-            chunk_data = [
-                {
-                    "requirement_id":   c.requirement_ids[0] if c.requirement_ids else "REQ-001",
-                    "content":          c.content,
-                    "module":           c.module,
-                    "requirement_type": c.requirement_type,
-                }
-                for c in chunks
-            ]
-            generation_queue["chunks"]     = chunk_data
-            generation_queue["session_id"] = request.session_id
-            generation_queue["status"]     = "queued"
-            logger.info(f"Queued {len(chunk_data)} chunks for Claude AI")
-
+        # Rule-based engine ONLY — Claude AI uses /api/generate/ai (separate endpoint)
         try:
             test_cases, removed = generate_all(chunks, review_points)
         except Exception:
@@ -393,6 +378,98 @@ def generate(request: GenerateRequest):
             traceback.format_exc(),
             "Check server logs for details.",
         )
+
+
+# ─── GENERATE (Claude AI) ─────────────────────────────────────────────────────
+
+@app.post("/api/generate/ai")
+async def generate_ai(request: Request):
+    """
+    Claude AI generation endpoint — triggered exclusively by the
+    "Generate Test Cases using Claude AI" button.
+
+    Ingests the uploaded document, extracts requirement chunks, queues them
+    for Claude Desktop (via MCP), and returns the queued chunk count.
+    Claude Desktop processes them asynchronously; the React UI polls
+    /api/ai/status and /api/mcp/latest to detect when results are ready.
+
+    The rule-based engine is NOT called here.
+    """
+    try:
+        data       = await request.json()
+        session_id = data.get("session_id")
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        session = sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found. Upload a file first.")
+
+        text = session["text"]
+
+        icd_text = ""
+        icd_session_id = data.get("icd_session_id")
+        if icd_session_id and icd_session_id in sessions:
+            icd_text = sessions[icd_session_id].get("text", "")
+
+        supporting_text = ""
+        supporting_session_id = data.get("supporting_session_id")
+        if supporting_session_id and supporting_session_id in sessions:
+            supporting_text = sessions[supporting_session_id].get("text", "")
+
+        combined_text = text
+        if icd_text:
+            combined_text += f"\n\n[ICD_DOCUMENT_START]\n{icd_text}\n[ICD_DOCUMENT_END]"
+        if supporting_text:
+            combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
+
+        chunks = ingest_document(combined_text, CHUNK_SIZE_WORDS)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "No requirements found",
+                    "suggestion": "Verify SRS language uses shall/must/should.",
+                },
+            )
+
+        chunk_data = [
+            {
+                "requirement_id":   c.requirement_ids[0] if c.requirement_ids else "REQ-001",
+                "content":          c.content,
+                "module":           c.module,
+                "requirement_type": c.requirement_type,
+            }
+            for c in chunks
+        ]
+
+        # Store chunks in session for reference and queue for Claude AI
+        sessions[session_id]["chunks"] = chunks
+        generation_queue["chunks"]     = chunk_data
+        generation_queue["session_id"] = session_id
+        generation_queue["status"]     = "queued"
+
+        # Clear any stale MCP results so the UI does not show old data
+        mcp_results_store["test_cases"] = []
+        mcp_results_store["summary"]    = None
+        mcp_results_store["timestamp"]  = None
+
+        logger.info(
+            f"AI generation queued: {len(chunk_data)} chunks "
+            f"(session={session_id})"
+        )
+        return {
+            "status":       "queued",
+            "total_chunks": len(chunk_data),
+            "session_id":   session_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI queue error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── EXPORT ───────────────────────────────────────────────────────────────────

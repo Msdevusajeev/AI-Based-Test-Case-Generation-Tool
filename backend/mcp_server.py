@@ -290,11 +290,15 @@ def _extract_nlp_context_for_queue() -> str:
                     "test_environment     — use test_environment from NLP context (Dev/QA/UAT/Prod)",
                     "design_methodology   — use scenario_methodologies[scenario_type] from NLP context",
                     "dependent_test_cases — 'None' for SC_001 (normal); 'TC_XX_NNN_SC-001' for all others",
-                    "inputs               — list of strings: realistic test input values for the scenario",
+                    "inputs               — list of strings in 'SignalName: Value' format (e.g. 'Tail Low Condition: True')",
                     "objective            — clear, specific statement of what is being verified; no modal verbs (shall/must/can/will)",
                     "preconditions        — list of strings: specific, testable conditions that must be true before execution",
                     "test_steps           — list of strings: numbered, actionable steps (e.g. '1. Navigate to ...')",
-                    "expected_outcome     — precise, measurable result; no modal verbs",
+                    "expected_outcome     — MUST start with 'ActualSignalName = Value. ' using the REAL output signal name "
+                                           "extracted from the requirement (e.g. 'Altitude Alert Condition Enabled = True. '). "
+                                           "For normal/boundary scenarios the value is True/Enabled/Active; "
+                                           "for edge/robustness scenarios the value is False/Disabled/Inactive. "
+                                           "Never use generic placeholders like 'Output signal' or 'output'.",
                     "remarks              — risk, compliance, ambiguity, or coverage observations relevant to this scenario",
                 ],
                 "generation_rules": [
@@ -303,7 +307,8 @@ def _extract_nlp_context_for_queue() -> str:
                     "No modal verbs (shall/must/can/will) anywhere in objective, steps, or expected_outcome",
                     "test_steps must be an array of numbered strings: ['1. Do X', '2. Do Y']",
                     "preconditions must be an array of strings",
-                    "inputs must be an array of strings with realistic values",
+                    "inputs must be an array of strings in 'SignalName: Value' format using the actual signal names from the requirement",
+                    "expected_outcome MUST begin with 'RealSignalName = True/False. ' — extract the output signal name from the requirement sentence itself; do NOT use 'output', 'Output signal', or any generic placeholder",
                     "If notes_context is present, incorporate enum definitions or cross-references into remarks",
                     "For sub-requirements (is_sub_req=true), reference parent_id in dependent_test_cases for the normal scenario",
                     "After generating all test cases, call save_enhanced_test_cases with the complete list",
@@ -464,7 +469,9 @@ def _extract_and_generate_single(req_text: str, req_id: str, module: str) -> str
                     "No modal verbs (shall/must/can/will) in objective, steps, or expected_outcome",
                     "test_steps: array of numbered strings ['1. ...', '2. ...']",
                     "preconditions: array of strings",
-                    "inputs: array of strings with realistic values",
+                    "inputs: array of strings in 'SignalName: Value' format using actual signal names from the requirement",
+                    "expected_outcome MUST start with 'RealSignalName = True/False. ' using the actual output signal name from the requirement — never use 'output', 'Output signal', or any generic placeholder",
+                    "For normal/boundary scenarios the output value is True/Enabled/Active; for edge/robustness it is False/Disabled/Inactive",
                     "dependent_test_cases: 'None' for SC_001, 'TC_XX_NNN_SC-001' for others",
                     "After generating, call save_enhanced_test_cases",
                 ],

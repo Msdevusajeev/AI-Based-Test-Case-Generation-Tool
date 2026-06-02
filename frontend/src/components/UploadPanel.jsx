@@ -39,11 +39,11 @@ function FileDropZone({ docType, file, loading, error, onFile, onClear }) {
           {docType.label}
         </span>
         <span className="text-xs text-dim">{docType.desc}</span>
-        {docType.required && <span className="text-red-400 text-xs">*required</span>}
+        {docType.required && <span className="text-red-400 text-xs">*Mandatory</span>}
       </div>
 
       <div
-        className={`drop-zone rounded-xl p-5 text-center cursor-pointer select-none ${dragging ? 'drag-over' : ''}`}
+        className={`drop-zone rounded-xl p-5 cursor-pointer select-none ${dragging ? 'drag-over' : ''}`}
         onClick={() => inputRef.current.click()}
         onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
         onDragLeave={() => setDragging(false)}
@@ -80,13 +80,15 @@ function FileDropZone({ docType, file, loading, error, onFile, onClear }) {
             </div>
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-2">
-            <div className="w-10 h-10 rounded-xl border border-border flex items-center justify-center text-2xl bg-card">📋</div>
-            <p className="text-dim text-sm">Drop {docType.label} document or click to browse</p>
-            <div className="flex gap-1 mt-1">
-              {ACCEPTED.map(e => (
-                <span key={e} className="px-2 py-0.5 rounded text-xs font-mono bg-border text-dim">{e}</span>
-              ))}
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl border border-border flex items-center justify-center text-2xl bg-card flex-shrink-0">📋</div>
+            <div className="flex flex-col items-start gap-1">
+              <p className="text-dim text-sm">Drop {docType.label} document here or click to browse</p>
+              <div className="flex gap-1">
+                {ACCEPTED.map(e => (
+                  <span key={e} className="px-2 py-0.5 rounded text-xs font-mono bg-border text-dim">{e}</span>
+                ))}
+              </div>
             </div>
           </div>
         )}
@@ -160,7 +162,7 @@ export default function UploadPanel({ onUploaded }) {
     <div className="fade-in">
       <div className="flex items-center gap-3 mb-4">
         <div className="w-7 h-7 rounded bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-sm font-mono font-bold">1</div>
-        <h2 className="text-base font-semibold text-text">Upload Documents</h2>
+        <h2 className="text-base font-semibold text-text">Upload Requirements</h2>
         <span className="text-xs text-dim">SRS (required) + ICD + Supporting</span>
       </div>
 
