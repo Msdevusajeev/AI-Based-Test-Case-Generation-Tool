@@ -254,6 +254,7 @@ const totalWidth = COLUMNS.reduce((s, c) => s + c.width, 0)
 // ─── MAIN COMPONENT ────────────────────────────────────────────────────────
 export default function ResultsTable({ testCases }) {
   const [filters, setFilters] = useState({
+    requirement_id:   'All',
     module:           'All',
     priority:         'All',
     scenario_type:    'All',
@@ -265,6 +266,7 @@ export default function ResultsTable({ testCases }) {
   const PAGE_SIZE = 50
 
   const opts = useMemo(() => ({
+    requirement_id:   unique(testCases.map(t => t.traceability_req_id)),
     module:           unique(testCases.map(t => moduleAlphaOnly(t.module))),
     priority:         unique(testCases.map(t => t.priority)),
     scenario_type:    unique(testCases.map(t => t.scenario_type)),
@@ -276,6 +278,7 @@ export default function ResultsTable({ testCases }) {
     const q = search.toLowerCase()
     return testCases.filter(tc => {
       const mod = moduleAlphaOnly(tc.module)
+      if (filters.requirement_id   !== 'All' && tc.traceability_req_id !== filters.requirement_id) return false
       if (filters.module           !== 'All' && mod                !== filters.module)           return false
       if (filters.priority         !== 'All' && tc.priority        !== filters.priority)         return false
       if (filters.scenario_type    !== 'All' && tc.scenario_type   !== filters.scenario_type)    return false
@@ -334,6 +337,7 @@ export default function ResultsTable({ testCases }) {
               className="bg-surface border border-border text-dim text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-amber/50"
             />
           </div>
+          <FilterSelect k="requirement_id"   label="Req ID" />
           <FilterSelect k="module"           label="Module" />
           <FilterSelect k="priority"         label="Priority" />
           <FilterSelect k="scenario_type"    label="Scenario" />
@@ -341,7 +345,7 @@ export default function ResultsTable({ testCases }) {
           <FilterSelect k="requirement_type" label="Req Type" />
           <button
             onClick={() => {
-              setFilters({ module: 'All', priority: 'All', scenario_type: 'All', testing_type: 'All', requirement_type: 'All' })
+              setFilters({ requirement_id: 'All', module: 'All', priority: 'All', scenario_type: 'All', testing_type: 'All', requirement_type: 'All' })
               setSearch(''); setPage(1)
             }}
             className="text-xs text-muted hover:text-amber transition-colors self-end pb-1.5"

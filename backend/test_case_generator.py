@@ -557,12 +557,12 @@ def _generate_decision_table_tcs(
         )
 
         active_conditions = [
-            f"{name}={value}"
+            f"{name} = {value}"
             for name, value in inputs_dict.items()
             if str(value).strip().lower() in ("true", "active", "1", "yes")
         ]
         inactive_conditions = [
-            f"{name}={value}"
+            f"{name} = {value}"
             for name, value in inputs_dict.items()
             if str(value).strip().lower() not in ("true", "active", "1", "yes")
         ]
@@ -570,7 +570,8 @@ def _generate_decision_table_tcs(
         if positive:
             remarks = (
                 f"DECISION TABLE — {sc_id} is the POSITIVE scenario: "
-                f"all conditions met ({', '.join(active_conditions)}). "
+                f"all conditions met. Active inputs: "
+                + "; ".join(active_conditions) + ". "
                 f"Verifies that the output is correctly set to TRUE when all "
                 f"required conditions are simultaneously active."
                 f"{test_basis}{notes_suffix}"
@@ -578,7 +579,8 @@ def _generate_decision_table_tcs(
         else:
             remarks = (
                 f"DECISION TABLE — {sc_id} is a NEGATIVE scenario: "
-                f"condition(s) not met: {', '.join(inactive_conditions)}. "
+                f"condition(s) not met. Inactive/violated inputs: "
+                + "; ".join(inactive_conditions) + ". "
                 f"Verifies that the output correctly remains FALSE when at "
                 f"least one required condition is violated."
                 f"{test_basis}{notes_suffix}"
@@ -907,11 +909,16 @@ def _generate_mcdc_tcs(
     baseline_remarks = (
         f"• MC/DC BASELINE ({logic}-logic) — {req_id}\n"
         f"• All {len(conditions)} conditions set to their required values → {output_name} = {baseline_output}\n"
+        f"• Conditions (each evaluated independently):\n"
+        + "\n".join(
+            f"    - {c['name']} = {c['required_val']}"
+            for c in conditions
+        ) + "\n"
         f"• This TC is the reference for ALL independence pairs:\n"
         + "\n".join(
             f"  - {s['indep_cond']}: baseline (this TC) ↔ "
             f"TC_UT_{tc_counters['UT'] + i + 1:03d} "
-            f"[{s['indep_cond']} changes {s['from_val']}→{s['to_val']}, output changes]"
+            f"[{s['indep_cond']} changes {s['from_val']} → {s['to_val']}, output changes]"
             for i, s in enumerate(flip_scenarios)
         ) + "\n"
         f"• MC/DC satisfies DO-178C Level A/B requirement independence criterion\n"
@@ -976,8 +983,14 @@ def _generate_mcdc_tcs(
         flip_remarks = (
             f"• MC/DC INDEPENDENCE TEST — condition: '{sc['indep_cond']}' ({req_id})\n"
             f"• Independence pair: {baseline_tc_id} (baseline) ↔ {tc_id} (this TC)\n"
-            f"• What changed: {sc['indep_cond']} = {sc['from_val']} → {sc['to_val']}\n"
-            f"• All other conditions unchanged from baseline\n"
+            f"• Changed condition (independent flip):\n"
+            f"    - {sc['indep_cond']} = {sc['from_val']} → {sc['to_val']}\n"
+            f"• Unchanged conditions (identical to baseline):\n"
+            + "\n".join(
+                f"    - {c['name']} = {sc['inputs'][c['name']]}"
+                for c in conditions
+                if c['name'] != sc['indep_cond']
+            ) + "\n"
             f"• Output change: {baseline_output} → {sc['output']} "
             f"(proves {sc['indep_cond']} independently controls the {logic}-decision)\n"
             f"• MC/DC criterion satisfied for '{sc['indep_cond']}': "

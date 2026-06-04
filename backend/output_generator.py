@@ -123,6 +123,11 @@ def _is_valid_input_signal(entry: str, is_signal_tc: bool) -> bool:
     Accepts both:
       "SignalName: Value"   (rule-based engine format)
       "SignalName = Value"  (Claude AI generated format)
+
+    Each input entry is treated as an independent signal regardless of
+    methodology — name and value are never combined into a single cell.
+    The is_signal_tc flag is retained for API compatibility but no longer
+    restricts which entries qualify; the name-validity check alone gates entry.
     """
     if ':' not in entry and '=' not in entry:
         return False
@@ -136,22 +141,10 @@ def _is_valid_input_signal(entry: str, is_signal_tc: bool) -> bool:
     name_lower = name.lower()
     if any(phrase in name_lower for phrase in _GENERIC_INPUT_PHRASES):
         return False
-    if is_signal_tc:
-        # For signal TCs: accept single or multi-word values (True/False/Active/Inactive/Running)
-        # Reject only obvious generic descriptions
-        return True
-    else:
-        # For standard TCs: value must be 1 word (pure enum/boolean)
-        value_words = value.split()
-        if len(value_words) != 1:
-            return False
-        generic_vals = {"valid","invalid","none","null","undefined","minimum",
-                        "maximum","boundary","normal","standard","initialised",
-                        "initialized","configured","enabled","disabled",
-                        "authorised","authorized","authenticated"}
-        if value_words[0].lower() in generic_vals:
-            return False
-        return True
+    # Accept all Name:Value / Name=Value entries as independent signals.
+    # Values of any length (enum, boolean, short prose) are valid —
+    # the column header is the signal name and the cell holds the value.
+    return True
 
 
 def _parse_output_clause(clause: str) -> List[Tuple[str, str]]:
@@ -370,25 +363,61 @@ def _extract_output_signal(expected_outcome: str) -> Tuple[str, str]:
     return name, value
 
 
+def _normalise_signal_name(name: str) -> str:
+    """
+    Returns a canonical form of a signal name for deduplication purposes.
+
+    Collapses whitespace, lowercases, and strips common scenario-type
+    qualifiers that Claude AI sometimes appends to signal names when
+    generating multiple scenario TCs (normal / boundary / edge / robustness).
+
+    Examples:
+      "Tail Low Condition"          → "tail low condition"
+      "tail low condition"          → "tail low condition"
+      "TAIL LOW CONDITION"          → "tail low condition"
+      "Tail Low Condition (normal)" → "tail low condition"
+      "Tail Low Condition_boundary" → "tail low condition"
+      "Tail Low Condition - edge"   → "tail low condition"
+    """
+    s = re.sub(r'\s+', ' ', name.strip()).lower()
+    # Strip trailing scenario-type qualifiers added by Claude AI
+    _QUALIFIERS = (
+        r'\s*[\(\[]\s*(?:normal|boundary|edge|robustness|positive|negative|'
+        r'baseline|flip|invalid|valid|min|max|minimum|maximum)\s*[\)\]]',
+        r'\s*[-_]\s*(?:normal|boundary|edge|robustness|positive|negative|'
+        r'baseline|flip|invalid|valid|min|max|minimum|maximum)\s*$',
+    )
+    for pat in _QUALIFIERS:
+        s = re.sub(pat, '', s, flags=re.IGNORECASE).strip()
+    return s
+
+
 def extract_signal_columns(test_cases: List[TestCase]) -> Tuple[List[str], List[str]]:
     """
     Returns (input_signal_names, output_signal_names) for the given test cases.
 
     Input signals:
-      - For condition coverage / decision table / MC/DC TCs: all "Name: Value"
-        inputs are treated as signals (they are always proper signal pairs).
-      - For standard TCs: only single-word-value inputs qualify.
+      Every "Name: Value" or "Name = Value" entry in tc.inputs is treated as
+      an independent signal and gets its own dedicated sub-column in the Excel
+      sheet.  Input names are collected in first-seen order across all TCs.
+
+      Deduplication uses a normalised key (lowercase + collapsed whitespace +
+      stripped scenario-type qualifiers) so the same physical signal appearing
+      with minor casing/spacing/suffix variants across different scenario TCs
+      maps to a single column — not to separate duplicate columns.
 
     Output signals:
-      - Extracted from the first clause of expected_outcome using "SignalName = Value"
-        format. Handles "For scenario SC_N: SignalName = Value" prefix correctly.
+      Extracted from the first clause of expected_outcome using "SignalName = Value"
+      format.
     """
-    in_sigs:  List[str] = []
-    out_sigs: List[str] = []
-    seen_in:  set = set()
-    seen_out: set = set()
+    in_sigs:     List[str] = []   # canonical (first-seen) signal names
+    out_sigs:    List[str] = []
+    seen_in_key: set = set()      # normalised keys to prevent duplicate columns
+    seen_out:    set = set()
 
     for tc in test_cases:
+        # is_signal_tc kept for _is_valid_input_signal API; all entries now
+        # treated independently regardless of methodology.
         is_signal_tc = tc.design_methodology.lower() in _SIGNAL_METHODOLOGIES
 
         # ── Input signals ──────────────────────────────────────────────────────
@@ -396,43 +425,54 @@ def extract_signal_columns(test_cases: List[TestCase]) -> Tuple[List[str], List[
             if not _is_valid_input_signal(entry, is_signal_tc):
                 continue
             name, _ = _parse_signal_value(entry)
-            if name and name not in seen_in:
-                seen_in.add(name)
-                in_sigs.append(name)
+            if not name:
+                continue
+            # Use a normalised key for dedup so case/whitespace/suffix variants
+            # of the same signal name don't produce separate columns.
+            norm_key = _normalise_signal_name(name)
+            if norm_key not in seen_in_key:
+                seen_in_key.add(norm_key)
+                in_sigs.append(name)   # store the first-seen form as the column header
 
         # ── Output signals ─────────────────────────────────────────────────────
-        # Detect output signals from expected_outcome.
-        # Pass seen_in so input signal names are excluded from output detection.
-        # Handles all formats: "Signal = Value", prose "sets X to Y", "X is Y"
+        # Pass seen_in_key (as lowercase names) to exclude input signal names
+        # from output detection.
         for sig_name, _ in _extract_all_output_signals_with_values(
-            tc.expected_outcome, exclude_names=seen_in
+            tc.expected_outcome, exclude_names={k for k in seen_in_key}
         ):
-            if sig_name not in seen_out:
-                seen_out.add(sig_name)
+            norm_out = _normalise_signal_name(sig_name)
+            if norm_out not in seen_out:
+                seen_out.add(norm_out)
                 out_sigs.append(sig_name)
 
     return in_sigs, out_sigs
 
 
 def _get_signal_value(tc: TestCase, signal_name: str, kind: str) -> str:
-    """Returns the value for a specific signal from a test case."""
+    """
+    Returns the value for a specific signal from a test case.
+
+    Matching uses the normalised signal name (_normalise_signal_name) so
+    that casing, whitespace, and scenario-type suffix variants in Claude AI
+    output still resolve to the correct column.
+    """
+    norm_target = _normalise_signal_name(signal_name)
     if kind == "input":
         for entry in tc.inputs:
             name, value = _parse_signal_value(entry)
-            if name.lower() == signal_name.lower():
+            if _normalise_signal_name(name) == norm_target:
                 return value
         return ""
     # Output: search in expected_outcome, excluding input signal names
-    # Build a rough set of input-like names from tc.inputs to exclude
     input_names = set()
     for entry in tc.inputs:
         n, _ = _parse_signal_value(entry)
         if n:
-            input_names.add(n)
+            input_names.add(_normalise_signal_name(n))
     for sname, sval in _extract_all_output_signals_with_values(
         tc.expected_outcome, exclude_names=input_names
     ):
-        if sname.lower() == signal_name.lower():
+        if _normalise_signal_name(sname) == norm_target:
             return sval
     return ""
 
@@ -755,11 +795,15 @@ def _extract_output_value_only(expected_outcome: str) -> str:
 def _write_tc_row(ws, row_idx: int, tc: TestCase,
                   col_map: dict, in_sigs: List[str], out_sigs: List[str]) -> None:
     """
-    Writes one TC row into worksheet ws.
-    Standalone function — no closure issues.
-    Each input signal goes into its OWN sub-column.
-    Each output signal goes into its OWN sub-column.
-    Falls back to combined text when no signals detected.
+    Writes one TC row into worksheet ws at row_idx.
+
+    One row = one test case.  Each input signal is written independently into
+    its own sub-column (never combined with other signals).  The signal name is
+    the sub-column header; the cell receives only the plain value for that TC.
+
+    For TCs that have no named-signal inputs (generic template strings), the
+    combined inputs text falls back to the first sub-column so the row is never
+    left completely blank.
     """
     is_alt = (row_idx % 2 == 0)
     tc_id  = tc.test_case_id
@@ -783,43 +827,33 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
     _p(col_map["Test Precondition"],       _col_f_precondition(tc, in_sigs))
 
     # ── Input sub-columns ──────────────────────────────────────────────────────
-    # Each signal gets its OWN column: Inputs_start+0, Inputs_start+1, …
-    # For TCs that have named signal inputs (MCDC / decision-table) each signal
-    # value is written into its dedicated sub-column.
-    # For standard TCs whose inputs are generic template strings (no matching
-    # signal names), we fall back to writing the combined inputs text in the
-    # first sub-column so the row is never left completely blank.
+    # Each named signal gets its own dedicated column.
+    # _get_signal_value looks up the value for that signal name from tc.inputs.
+    # This guarantees every input is handled independently — no merging of
+    # signal names with their values into a single combined cell.
     if in_sigs:
-        # Collect per-signal values for this TC
         sig_values = [_get_signal_value(tc, sig, "input") for sig in in_sigs]
         if any(sig_values):
-            # At least one signal matched → write per-signal
+            # Named signals matched — write each value into its own sub-column.
             for idx_i, val in enumerate(sig_values):
                 _p(col_map["Inputs_start"] + idx_i, val, center=True)
         else:
-            # No signal matched (standard / generic TC) → write combined text
-            # in the first sub-column; leave the others empty (they belong to
-            # signal TCs on the same sheet).
+            # No named signal matched for this TC (generic template row).
+            # Write combined inputs text in the first sub-column only.
             _p(col_map["Inputs_start"], _list_to_str(tc.inputs))
     else:
-        # No named signals at all → write combined text to the single Inputs cell
+        # No named signals on this sheet — write combined text to single cell.
         _p(col_map["Inputs_start"], _list_to_str(tc.inputs))
 
     # ── Test Steps ─────────────────────────────────────────────────────────────
     _p(col_map["Test Steps"], _list_to_str(tc.test_steps))
 
     # ── Output sub-columns ─────────────────────────────────────────────────────
-    # Each output signal gets its OWN column: Outputs_start+0, +1, …
-    # The cell must contain ONLY the plain value (True / False / Active / …)
-    # with no signal-name label prefix.
     if out_sigs:
         for idx_o, sig in enumerate(out_sigs):
             val = _get_signal_value(tc, sig, "output")
             _p(col_map["Outputs_start"] + idx_o, val, center=True)
     else:
-        # No named output signals — extract only the value from expected_outcome.
-        # If the outcome begins with "SignalName = Value." we want just "Value".
-        # Otherwise fall back to the first sentence.
         _p(col_map["Outputs_start"], _extract_output_value_only(tc.expected_outcome), center=True)
 
     # ── Suffix columns ─────────────────────────────────────────────────────────

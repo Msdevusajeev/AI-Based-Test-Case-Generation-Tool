@@ -56,7 +56,14 @@ def _ids_at_line_start(line: str) -> List[str]:
 
     m = _SECTION_ID.match(first_tok)
     if m:
-        return [m.group(1)]
+        # A bare section number (e.g. "1.1", "2.3.4") is only a requirement ID
+        # if the rest of the line contains a requirement keyword.
+        # Without this guard, PDF section headings like "1.1 Introduction"
+        # are wrongly treated as requirement IDs.
+        rest = ' '.join(parts[1:]).lower()
+        _REQ_KW = ('shall', 'must', 'should', 'will ', 'is required', 'has to')
+        if any(kw in rest for kw in _REQ_KW):
+            return [m.group(1)]
 
     if len(parts) >= 2:
         combined = ''.join(parts[:3]).strip('[]().,;:')
@@ -91,7 +98,10 @@ def _all_ids_in_line(line: str) -> List[str]:
         else:
             sm = _SECTION_ID.match(clean)
             if sm:
-                found.append(sm.group(1))
+                # Only treat section numbers as IDs when they appear
+                # next to a real requirement (not as standalone tokens)
+                # Skip pure section numbers to avoid picking up "1.1", "2.3" etc.
+                pass   # bare section numbers are resolved in _ids_at_line_start only
     seen, unique = set(), []
     for x in found:
         key = x.lower()
@@ -231,7 +241,28 @@ def _clean_module_name(raw: str) -> Optional[str]:
 
     # Collapse whitespace and title-case
     cleaned = ' '.join(raw.split())
-    return cleaned if cleaned else None
+    if not cleaned:
+        return None
+
+    _NON_REQ = re.compile(
+        r'''^(?:
+            introduction | scope | purpose | overview | background |
+            foreword | preface | summary | executive\s+summary |
+            references? | normative\s+references? | informative\s+references? |
+            applicable\s+documents? | related\s+documents? |
+            definitions? | abbreviations? | acronyms? | glossary | terms? |
+            table\s+of\s+contents? | contents? | index |
+            revision\s+history | change\s+(?:log|history|record) |
+            document\s+(?:history|control|organization|structure) |
+            applicability | general\s+information | general |
+            list\s+of\s+(?:figures?|tables?) | nomenclature | standards?
+        )$''',
+        re.IGNORECASE | re.VERBOSE,
+    )
+    if _NON_REQ.match(cleaned):
+        return None
+
+    return cleaned
 
 
 def parse_requirements_from_text(text: str) -> List[Dict]:

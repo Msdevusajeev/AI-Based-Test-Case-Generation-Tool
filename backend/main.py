@@ -1,4 +1,5 @@
 import logging
+import re
 import traceback
 import uuid
 from collections import Counter
@@ -141,6 +142,33 @@ def _normalise_mcp_tc(raw: dict) -> dict:
             tc[list_field] = [v.strip() for v in val.split("\n") if v.strip()]
         elif not isinstance(val, list):
             tc[list_field] = [str(val)] if val else []
+
+    # Normalise input signal names: collapse whitespace and strip scenario-type
+    # qualifiers that Claude AI sometimes appends when generating multiple TCs
+    # (normal / boundary / edge / robustness) for the same requirement.
+    # This ensures "CondA (boundary): False" and "CondA: True" both map to
+    # the single "CondA" column rather than creating two separate columns.
+    _QUAL_RE = re.compile(
+        r"\s*[\(\[]\s*(?:normal|boundary|edge|robustness|positive|negative|"
+        r"baseline|flip|invalid|valid|min|max|minimum|maximum)\s*[\)\]]"
+        r"|\s*[-_]\s*(?:normal|boundary|edge|robustness|positive|negative|"
+        r"baseline|flip|invalid|valid|min|max|minimum|maximum)\s*$",
+        re.IGNORECASE,
+    )
+    normalised_inputs = []
+    for entry in tc.get("inputs", []):
+        if not isinstance(entry, str):
+            entry = str(entry)
+        sep = ":" if ":" in entry else ("=" if "=" in entry else None)
+        if sep:
+            parts = entry.split(sep, 1)
+            raw_name  = parts[0].strip()
+            raw_value = parts[1].strip() if len(parts) > 1 else ""
+            # Strip scenario qualifier from name and normalise whitespace
+            clean_name = re.sub(r"\s+", " ", _QUAL_RE.sub("", raw_name).strip())
+            entry = f"{clean_name}{sep} {raw_value}" if raw_value else clean_name
+        normalised_inputs.append(entry)
+    tc["inputs"] = normalised_inputs
 
     defaults = {
         "traceability_req_id":  "REQ-001",
@@ -292,6 +320,39 @@ async def upload(file: UploadFile = File(...), doc_type: str = "srs"):
 
 # ─── GENERATE ─────────────────────────────────────────────────────────────────
 
+@app.get("/api/scope")
+def get_scope(session_id: str = Query(...)):
+    """
+    Returns every unique requirement ID and module name found in the
+    uploaded document so the frontend can populate the scope selector.
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    text   = session.get("text", "")
+    chunks = ingest_document(text)
+
+    req_ids: list = []
+    modules: list = []
+    seen_r:  set  = set()
+    seen_m:  set  = set()
+
+    for c in sorted(chunks, key=lambda x: (x.requirement_ids[0] if x.requirement_ids else "")):
+        rid = c.requirement_ids[0] if c.requirement_ids else None
+        if rid and rid not in seen_r:
+            seen_r.add(rid)
+            req_ids.append(rid)
+        mod = c.module or "General"
+        if mod not in seen_m:
+            seen_m.add(mod)
+            modules.append(mod)
+
+    return {"requirement_ids": req_ids, "modules": sorted(modules)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/api/generate", response_model=GenerateResponse)
 def generate(request: GenerateRequest):
     session = sessions.get(request.session_id)
@@ -316,6 +377,28 @@ def generate(request: GenerateRequest):
             combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
 
         chunks = ingest_document(combined_text, CHUNK_SIZE_WORDS)
+
+        # ── Scope filter ─────────────────────────────────────────────────────
+        # If the user selected specific requirement IDs, keep only those chunks.
+        # If the user selected a module, keep only chunks for that module.
+        logger.info(f"[SCOPE] selected_req_ids={request.selected_req_ids!r}  "
+                    f"selected_module={request.selected_module!r}  "
+                    f"total_chunks={len(chunks)}")
+
+        if request.selected_req_ids is not None:
+            keep   = set(request.selected_req_ids)
+            before = len(chunks)
+            chunks = [c for c in chunks
+                      if any(rid in keep for rid in c.requirement_ids)]
+            logger.info(f"[SCOPE] req filter → {before} → {len(chunks)} chunks | keep={keep}")
+        elif request.selected_module and request.selected_module != "__all__":
+            before = len(chunks)
+            chunks = [c for c in chunks
+                      if (c.module or "General") == request.selected_module]
+            logger.info(f"[SCOPE] module filter → {before} → {len(chunks)} chunks")
+        else:
+            logger.info(f"[SCOPE] no filter — generating for all {len(chunks)} chunks")
+        # ─────────────────────────────────────────────────────────────────────
 
         if not chunks:
             _error(
@@ -424,6 +507,29 @@ async def generate_ai(request: Request):
             combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
 
         chunks = ingest_document(combined_text, CHUNK_SIZE_WORDS)
+
+        # ── Scope filter (same logic as /api/generate) ────────────────────────
+        selected_req_ids = data.get("selected_req_ids")   # list or None
+        selected_module  = data.get("selected_module")    # str or None
+
+        logger.info(f"[SCOPE/AI] selected_req_ids={selected_req_ids!r}  "
+                    f"selected_module={selected_module!r}  "
+                    f"total_chunks={len(chunks)}")
+
+        if selected_req_ids is not None:
+            keep   = set(selected_req_ids)
+            before = len(chunks)
+            chunks = [c for c in chunks
+                      if any(rid in keep for rid in c.requirement_ids)]
+            logger.info(f"[SCOPE/AI] req filter → {before} → {len(chunks)} chunks | keep={keep}")
+        elif selected_module and selected_module != "__all__":
+            before = len(chunks)
+            chunks = [c for c in chunks
+                      if (c.module or "General") == selected_module]
+            logger.info(f"[SCOPE/AI] module filter → {before} → {len(chunks)} chunks")
+        else:
+            logger.info(f"[SCOPE/AI] no filter — queuing all {len(chunks)} chunks")
+        # ─────────────────────────────────────────────────────────────────────
 
         if not chunks:
             raise HTTPException(

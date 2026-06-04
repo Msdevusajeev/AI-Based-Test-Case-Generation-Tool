@@ -2,16 +2,126 @@ import io
 import fitz  # PyMuPDF
 from docx import Document
 import openpyxl
+import re
+import statistics
+
+
+# Sections that are NOT requirement modules — never emit [MODULE: ] for these.
+# Covers: introductory, administrative, and reference sections found in most SRS documents.
+_NON_REQ_SECTIONS = re.compile(
+    r'''(?xi)
+    ^(?:
+        \d+[\.]?\s*                          # optional leading number like "1." "1.2"
+    )?(?:
+        introduction | scope | purpose | overview | background | foreword | preface |
+        summary | executive\s+summary |
+        references? | normative\s+references? | informative\s+references? |
+        applicable\s+documents? | related\s+documents? |
+        definitions? | abbreviations? | acronyms? | glossary | terms? |
+        table\s+of\s+contents? | contents? | index |
+        revision\s+history | change\s+(log|history|record) | document\s+history |
+        document\s+control | document\s+organization | document\s+structure |
+        applicability | general\s+information | general |
+        list\s+of\s+(figures?|tables?) |
+        nomenclature | standards?
+    )\s*$
+    ''',
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def parse_pdf(file_bytes: bytes) -> str:
-    parts = []
+    """
+    Improved PDF parser that mirrors parse_docx behaviour:
+    - Detects section headings via font size and bold formatting
+    - Injects ## and [MODULE: ...] markers so document_ingestion.py
+      can correctly identify module boundaries
+    - SKIPS common non-requirement sections (Introduction, Scope, References…)
+      so they never pollute the module list or steal pending_module from
+      real requirement sections.
+
+    Strategy
+    --------
+    Pass 1  Collect every font size in the document to find the median
+            body-text size.
+    Pass 2  For each text line:
+            - If its max span size > body_size * 1.15  →  heading candidate
+            - If any span is bold AND line is short (<= 100 chars) →  heading candidate
+            - Heading candidates are then filtered:
+                * Lines matching a requirement-ID pattern  →  NOT a heading
+                * Lines matching _NON_REQ_SECTIONS         →  NOT a heading
+            Surviving headings get  ## prefix  +  [MODULE: ...] marker.
+            Everything else is emitted as plain text.
+    """
+    import statistics as _stats
+
+    _REQ_LINE = re.compile(
+        r'^[A-Z][A-Z0-9_\-\.]*\d+\s+(?:shall|must|should|will|the|is|are|a\s)',
+        re.IGNORECASE,
+    )
+
+    parts: list = []
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if text.strip():
-                parts.append(f"[Page {page_num + 1}]\n{text}")
+
+        # ── Pass 1: determine body-text font size ─────────────────────────────
+        all_sizes: list = []
+        for page in doc:
+            for block in page.get_text("dict")["blocks"]:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        txt = span.get("text", "").strip()
+                        sz  = span.get("size", 0)
+                        if txt and sz > 0:
+                            all_sizes.append(round(sz, 1))
+
+        body_size        = _stats.median(all_sizes) if all_sizes else 10.0
+        heading_min_size = body_size * 1.15          # >15 % larger → heading
+
+        # ── Pass 2: extract text with structure markers ───────────────────────
+        for page in doc:
+            for block in page.get_text("dict")["blocks"]:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    spans = line.get("spans", [])
+                    if not spans:
+                        continue
+
+                    line_text = "".join(s.get("text", "") for s in spans).strip()
+                    if not line_text or len(line_text) < 2:
+                        continue
+
+                    max_size = max((s.get("size", 0) for s in spans), default=0)
+                    is_bold  = any(
+                        "bold" in s.get("font", "").lower()
+                        for s in spans if s.get("text", "").strip()
+                    )
+
+                    # Is this line a heading?
+                    larger_font  = max_size > heading_min_size
+                    bold_heading = is_bold and len(line_text) <= 100
+                    is_heading   = larger_font or bold_heading
+
+                    # Never treat a requirement-ID line as a heading
+                    # Disqualify headings that are requirement ID lines
+                    if is_heading and _REQ_LINE.match(line_text):
+                        is_heading = False
+
+                    # Disqualify headings that are non-requirement admin sections
+                    # Strip leading section numbers before checking (e.g. "1. Introduction")
+                    _bare = re.sub(r'^\d+(?:\.\d+)*[.:\s]+', '', line_text).strip()
+                    if is_heading and _NON_REQ_SECTIONS.match(_bare):
+                        is_heading = False
+
+                    if is_heading:
+                        parts.append(f"\n## {line_text}")
+                        parts.append(f"[MODULE: {line_text}]")
+                    else:
+                        parts.append(line_text)
+
         doc.close()
     except Exception as e:
         raise RuntimeError(f"PDF parsing error: {e}")

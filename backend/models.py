@@ -68,6 +68,9 @@ class GenerateRequest(BaseModel):
     review_points: ReviewPoints
     icd_session_id: Optional[str] = None
     supporting_session_id: Optional[str] = None
+    # Scope filters — None means generate for all
+    selected_req_ids: Optional[List[str]] = None
+    selected_module:  Optional[str]       = None
 
 
 class GenerateSummary(BaseModel):

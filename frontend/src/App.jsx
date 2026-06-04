@@ -1,497 +1,765 @@
-import { useState, useEffect } from 'react'
-import UploadPanel       from './components/UploadPanel'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import ReviewPointsPanel from './components/ReviewPointsPanel'
-import SummaryBar        from './components/SummaryBar'
 import ResultsTable      from './components/ResultsTable'
+import ScopeSelector, { _scope } from './components/ScopeSelector'
 
 const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true }
+const ACCEPTED   = ['.pdf', '.docx', '.xlsx']
 
-function ExportButton({ label, href, disabled, color }) {
+// ─── tiny helpers ─────────────────────────────────────────────────────────────
+
+function formatBytes(n) {
+  if (!n) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`
+}
+
+// ─── Upload drop-zone ─────────────────────────────────────────────────────────
+
+function DropZone({ label, required, file, loading, error, onFile, onClear }) {
+  const [drag, setDrag] = useState(false)
+  const ref = useRef()
+  const ext = file?.name?.split('.').pop()?.toLowerCase()
+
+  const onDrop = useCallback(e => {
+    e.preventDefault(); setDrag(false); onFile(e.dataTransfer.files[0])
+  }, [onFile])
+
   return (
-    <a
-      href={disabled ? undefined : href}
-      className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium border transition-all
-        ${disabled
-          ? 'opacity-30 cursor-not-allowed border-border text-dim'
-          : color === 'green'
-            ? 'border-green-500/40 text-green-400 bg-green-500/10 hover:bg-green-500/20 cursor-pointer'
-            : 'border-blue-500/40 text-blue-400 bg-blue-500/10 hover:bg-blue-500/20 cursor-pointer'
-        }`}
-      download
+    <div
+      className={`rounded-xl border-2 border-dashed transition-all cursor-pointer select-none
+        ${drag           ? 'border-amber bg-amber/5'
+        : file           ? 'border-green-500/40 bg-green-500/5'
+        : error          ? 'border-red-500/40 bg-red-500/5'
+        :                  'border-border hover:border-amber/40 bg-card'}`}
+      onClick={() => !file && ref.current.click()}
+      onDragOver={e => { e.preventDefault(); setDrag(true) }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={onDrop}
     >
-      {label}
-    </a>
+      <input ref={ref} type="file" accept=".pdf,.docx,.xlsx" className="hidden"
+        onChange={e => onFile(e.target.files[0])} />
+
+      <div className="p-6">
+        {loading ? (
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-8 h-8 border-2 border-amber border-t-transparent rounded-full spin" />
+            <p className="text-sm text-dim">Uploading…</p>
+          </div>
+        ) : file ? (
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-xl bg-green-500/10 border border-green-500/30 flex items-center justify-center text-2xl flex-shrink-0">
+              {ext === 'pdf' ? '📄' : ext === 'docx' || ext === 'doc' ? '📝' : '📊'}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-text truncate">{file.name}</p>
+              <p className="text-xs text-dim font-mono mt-0.5">{formatBytes(file.size)}</p>
+              <span className="text-xs text-green-400 mt-0.5 block">✓ Uploaded successfully</span>
+            </div>
+            <button onClick={e => { e.stopPropagation(); onClear() }}
+              className="flex-shrink-0 text-dim hover:text-red-400 transition-colors text-sm px-2 py-1 rounded-lg hover:bg-red-500/10">
+              ✕ Remove
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-xl border border-border bg-surface flex items-center justify-center text-2xl flex-shrink-0">
+              📋
+            </div>
+            <div>
+              <p className="text-sm text-text font-medium">
+                Drop {label} here or <span className="text-amber underline">Click to browse</span>
+              </p>
+              <div className="flex items-center gap-2 mt-1.5">
+                {ACCEPTED.map(e => (
+                  <span key={e} className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">{e}</span>
+                ))}
+                {required && <span className="text-[10px] text-amber/80 font-medium">mandatory</span>}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      {error && (
+        <div className="px-4 pb-3">
+          <p className="text-xs text-red-400">⚠ {error}</p>
+        </div>
+      )}
+    </div>
   )
 }
 
-function ClaudeModal({ chunks, onOk }) {
-  const [checked, setChecked] = useState(false)
+// ─── Page: Upload ─────────────────────────────────────────────────────────────
+
+function PageUpload({ files, loading, errors, onFile, onClear, onNext }) {
+  const srsReady = !!files.srs
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="bg-surface border border-border rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6">
-        <p className="text-text text-sm font-semibold mb-3">
-          {chunks} requirement(s) queued for Claude AI!
-        </p>
-        <p className="text-dim text-sm mb-1 font-medium">Steps:</p>
-        <ol className="text-dim text-sm space-y-1 mb-5 list-decimal list-inside">
-          <li>Open Claude Desktop</li>
-          <li>Start a New Chat</li>
-          <li>Press Ctrl+V to paste</li>
-          <li>Press Enter</li>
-        </ol>
-        <p className="text-dim text-xs mb-5">
-          Results will appear here automatically when Claude finishes.
-        </p>
-        <label className="flex items-center gap-2 cursor-pointer mb-5 select-none">
-          <input
-            type="checkbox"
-            checked={checked}
-            onChange={e => setChecked(e.target.checked)}
-            className="w-4 h-4 accent-amber cursor-pointer"
-          />
-          <span className="text-dim text-sm">Don't ask me again</span>
-        </label>
-        <div className="flex justify-end">
-          <button
-            onClick={() => onOk(checked)}
-            className="px-6 py-2 rounded-xl bg-blue-500 hover:bg-blue-400 text-white text-sm font-semibold transition-all"
-          >
-            OK
-          </button>
+    <div className="max-w-3xl mx-auto px-6 py-8">
+      <div className="mb-8">
+        <h2 className="text-xl font-semibold text-text">Upload Requirements</h2>
+        <p className="text-sm text-dim mt-1">Start with your SRS document. ICD and supporting docs are optional but improve coverage.</p>
+      </div>
+
+      <div className="space-y-5">
+        {/* SRS */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-amber/15 text-amber border border-amber/30">SRS</span>
+            <span className="text-sm text-text font-medium">Software Requirements Specification</span>
+            <span className="text-xs text-red-400/80 ml-1">* Mandatory</span>
+          </div>
+          <DropZone label="SRS document" required
+            file={files.srs} loading={loading.srs} error={errors.srs}
+            onFile={f => onFile('srs', f)} onClear={() => onClear('srs')} />
         </div>
+
+        {/* ICD */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-border text-dim">ICD</span>
+            <span className="text-sm text-text font-medium">Interface Control Document</span>
+            <span className="text-xs text-dim ml-1">optional</span>
+          </div>
+          <DropZone label="ICD document"
+            file={files.icd} loading={loading.icd} error={errors.icd}
+            onFile={f => onFile('icd', f)} onClear={() => onClear('icd')} />
+        </div>
+
+        {/* Supporting */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-border text-dim">SUP</span>
+            <span className="text-sm text-text font-medium">Supporting Document</span>
+            <span className="text-xs text-dim ml-1">optional</span>
+          </div>
+          <DropZone label="supporting document"
+            file={files.supporting} loading={loading.supporting} error={errors.supporting}
+            onFile={f => onFile('supporting', f)} onClear={() => onClear('supporting')} />
+        </div>
+      </div>
+
+      <div className="mt-8 flex justify-end">
+        <button onClick={onNext} disabled={!srsReady}
+          className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center gap-2
+            ${srsReady
+              ? 'bg-amber hover:bg-amber/90 text-bg shadow-sm shadow-amber/20 cursor-pointer'
+              : 'bg-border text-dim cursor-not-allowed'}`}>
+          Next: Configure →
+        </button>
       </div>
     </div>
   )
 }
 
-export default function App() {
-  const [uploadData,   setUploadData]   = useState(null)
-  const [reviewPoints, setReviewPoints] = useState(DEFAULT_RP)
-  const [generating,   setGenerating]   = useState(false)
-  const [testCases,    setTestCases]    = useState([])
-  const [summary,      setSummary]      = useState(null)
-  const [error,        setError]        = useState('')
-  const [progress,     setProgress]     = useState('')
+// ─── Page: Configure ──────────────────────────────────────────────────────────
 
-  // ── MCP / Claude Desktop state ───────────────────────────────────────────
-  const [mode,         setMode]         = useState({ mode: 'offline', engine: 'Rule-Based NLP' })
+function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, onRpChange, customReviewPoints, onCustomReviewPointsChange, generating, onBack, onGenerate, onNext }) {
+  return (
+    <div className="max-w-5xl mx-auto px-6 py-8">
+      <div className="mb-8">
+        <h2 className="text-xl font-semibold text-text">Configure Generation</h2>
+        <p className="text-sm text-dim mt-1">Select which requirements to target and choose your review points.</p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+        {/* Scope */}
+        <div className="bg-card border border-border rounded-2xl p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="w-6 h-6 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">🎯</div>
+            <h3 className="text-sm font-semibold text-text">Scope</h3>
+            <span className="text-xs text-dim ml-1">— which requirements to generate for</span>
+          </div>
+          <ScopeSelector sessionId={sessionId} onChange={onScopeChange} />
+        </div>
+
+        {/* Review points */}
+        <div className="bg-card border border-border rounded-2xl p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="w-6 h-6 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">☑</div>
+            <h3 className="text-sm font-semibold text-text">Review points</h3>
+          </div>
+          <ReviewPointsPanel
+            reviewPoints={reviewPoints}
+            onChange={onRpChange}
+            disabled={generating}
+            customPoints={customReviewPoints}
+            onCustomPointsChange={onCustomReviewPointsChange}
+          />
+        </div>
+      </div>
+
+      <div className="mt-8 flex items-center justify-between">
+        <button onClick={onBack}
+          className="px-5 py-2.5 rounded-xl text-sm border border-border text-dim hover:border-amber/40 hover:text-text transition-all">
+          ← Back to Upload
+        </button>
+        <button onClick={onNext}
+          className="px-7 py-2.5 rounded-xl text-sm font-semibold bg-amber hover:bg-amber/90 text-bg shadow-sm shadow-amber/20 cursor-pointer transition-all flex items-center gap-2">
+          Next: Generate →
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ─── Page: Generate ───────────────────────────────────────────────────────────
+
+function PageGenerate({
+  testCases, summary, generating, progress, error, aiWaiting,
+  uploadDone, onGenerate, onClaudeGenerate, onRemindClaude,
+  onLoadMcp, mcpAvailable, mcpResults, onExport,
+}) {
+  const dupCount = summary?.duplicates_removed ?? 0
+  return (
+    <div className="flex flex-col h-full">
+
+      {/* Toolbar */}
+      <div className="flex-shrink-0 border-b border-border bg-surface px-6 py-3 flex items-center gap-3">
+        <div className="flex gap-2 flex-1 flex-wrap">
+          {summary ? (
+            <>
+              <span className="text-[11px] px-2 py-1 rounded-lg bg-card border border-border text-dim">
+                <strong className="text-text">{summary.total}</strong> test cases
+              </span>
+              <span className="text-[11px] px-2 py-1 rounded-lg bg-card border border-border text-dim">
+                <strong className="text-text">{Object.keys(summary.by_module || {}).length}</strong> modules
+              </span>
+              {dupCount > 0 && (
+                <span className="text-[11px] px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400">
+                  ⊘ <strong>{dupCount}</strong> duplicates removed
+                </span>
+              )}
+              <span className="text-[11px] px-2 py-1 rounded-lg bg-green-500/10 border border-green-500/30 text-green-400">
+                ✓ full coverage
+              </span>
+            </>
+          ) : error ? (
+            <span className="text-xs text-red-400">⚠ {error}</span>
+          ) : (
+            <span className="text-xs text-dim">{generating ? (progress || 'Generating…') : 'Click Generate to start'}</span>
+          )}
+        </div>
+
+      </div>
+
+      {/* MCP banner */}
+      {mcpAvailable && mcpResults && (
+        <div className="flex-shrink-0 mx-6 mt-3 px-4 py-2.5 rounded-xl bg-amber/10 border border-amber/30 flex items-center gap-3">
+          <span className="text-amber">✦</span>
+          <div className="flex-1">
+            <p className="text-xs font-medium text-amber">Claude AI results ready</p>
+            <p className="text-[10px] text-dim">{mcpResults.summary?.total ?? mcpResults.test_cases?.length} test cases generated</p>
+          </div>
+          <button onClick={onLoadMcp}
+            className="text-xs px-3 py-1.5 rounded-lg bg-amber text-bg font-semibold hover:bg-amber/90 transition-all">
+            Load Results
+          </button>
+        </div>
+      )}
+
+      {/* AI waiting */}
+      {aiWaiting && (
+        <div className="flex-shrink-0 mx-6 mt-3 px-4 py-3 rounded-xl bg-amber/5 border border-amber/20 flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-amber border-t-transparent rounded-full spin flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-xs text-amber font-medium">Waiting for Claude AI…</p>
+            <p className="text-[10px] text-dim">Paste the prompt into Claude Desktop and press Enter. Results appear here automatically.</p>
+          </div>
+          <button onClick={onRemindClaude}
+            className="text-[10px] text-dim hover:text-amber transition-colors underline flex-shrink-0">
+            Copy reminder →
+          </button>
+        </div>
+      )}
+
+      {/* Table or empty */}
+      {testCases.length > 0 ? (
+        <div className="flex-1 overflow-auto px-6 py-4">
+          <ResultsTable testCases={testCases} />
+        </div>
+      ) : generating ? (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-amber/10 border border-amber/30 flex items-center justify-center">
+            <div className="w-7 h-7 border-2 border-amber border-t-transparent rounded-full spin" />
+          </div>
+          <div>
+            <p className="text-sm font-medium text-amber">{progress || 'Generating test cases…'}</p>
+            <p className="text-xs text-dim mt-1">This usually takes a few seconds</p>
+          </div>
+        </div>
+      ) : error ? (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-center text-2xl">⚠</div>
+          <div>
+            <p className="text-sm font-medium text-red-400">Generation failed</p>
+            <p className="text-xs text-dim mt-1 max-w-xs">{error}</p>
+            <button onClick={onGenerate}
+              className="mt-3 px-4 py-2 rounded-lg bg-amber text-bg text-xs font-semibold hover:bg-amber/90 transition-all">
+              Try again
+            </button>
+          </div>
+        </div>
+      ) : (
+        /* ── Engine selection ── */
+        <div className="flex-1 flex flex-col items-center justify-center px-8 py-12">
+          <p className="text-base font-semibold text-text mb-2">Choose generation engine</p>
+          <p className="text-xs text-dim mb-8 text-center max-w-sm">
+            Rule-Based runs instantly offline. Claude AI produces richer, context-aware test cases using Claude Desktop.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 w-full max-w-2xl">
+
+            {/* Rule-Based card */}
+            <button onClick={onGenerate}
+              className="group text-left p-6 rounded-2xl border-2 border-amber/30 bg-amber/5 hover:border-amber hover:bg-amber/10 transition-all cursor-pointer">
+              <div className="w-12 h-12 rounded-xl bg-amber/15 border border-amber/30 flex items-center justify-center text-2xl mb-4">⚙</div>
+              <p className="text-sm font-semibold text-text mb-1">Rule-Based NLP</p>
+              <p className="text-xs text-dim leading-relaxed">
+                Instant offline generation. Uses deterministic NLP rules — MC/DC, condition coverage, decision table. No AI required.
+              </p>
+              <div className="mt-4 flex items-center gap-2">
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">Instant</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Offline</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Deterministic</span>
+              </div>
+            </button>
+
+            {/* Claude AI card */}
+            <button onClick={onClaudeGenerate}
+              className="group text-left p-6 rounded-2xl border-2 border-amber/30 bg-amber/5 hover:border-amber hover:bg-amber/10 transition-all cursor-pointer">
+              <div className="w-12 h-12 rounded-xl bg-amber/15 border border-amber/30 flex items-center justify-center text-2xl mb-4">✦</div>
+              <p className="text-sm font-semibold text-text mb-1">Claude AI</p>
+              <p className="text-xs text-dim leading-relaxed">
+                Uses Claude Desktop via MCP. Generates richer, context-aware test cases with detailed preconditions and objectives.
+              </p>
+              <div className="mt-4 flex items-center gap-2">
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber/15 text-amber border border-amber/30">AI-powered</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Requires Desktop</span>
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
+      {testCases.length > 0 && (
+        <button
+          onClick={onExport}
+          className="fixed bottom-6 right-6 z-50 flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber text-bg text-sm font-semibold shadow-lg hover:bg-amber/90 transition-all"
+        >
+          Export Results →
+        </button>
+      )}
+    </div>
+  )
+}
+
+function PageExport({ testCases, summary, sessionId, exportSource }) {
+  const dupCount = summary?.duplicates_removed ?? 0
+  const hasResults = testCases.length > 0
+
+  return (
+    <div className="max-w-4xl mx-auto px-6 py-8">
+      <div className="mb-8">
+        <h2 className="text-xl font-semibold text-text">Export Results</h2>
+        <p className="text-sm text-dim mt-1">Download your generated test cases as Excel or Word.</p>
+      </div>
+
+      {!hasResults ? (
+        <div className="text-center py-16 border border-dashed border-border rounded-2xl">
+          <p className="text-3xl mb-3">📋</p>
+          <p className="text-sm font-medium text-text">No test cases to export yet</p>
+          <p className="text-xs text-dim mt-1">Go to Generate and run the test case generator first</p>
+        </div>
+      ) : (
+        <>
+          {/* Summary stats */}
+          {summary && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+              {[
+                { label: 'Total test cases', value: summary.total },
+                { label: 'Requirements covered', value: Object.keys(summary.by_module || {}).length },
+                { label: 'Duplicates removed', value: dupCount, red: dupCount > 0 },
+                { label: 'Scenario types', value: Object.keys(summary.by_scenario_type || {}).length },
+              ].map(s => (
+                <div key={s.label}
+                  className={`rounded-xl p-4 border ${s.red ? 'bg-red-500/8 border-red-500/30' : 'bg-card border-border'}`}>
+                  <p className={`text-2xl font-semibold ${s.red ? 'text-red-400' : 'text-text'}`}>{s.value}</p>
+                  <p className="text-xs text-dim mt-0.5">{s.label}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Download cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+            <a
+              href={exportSource === 'mcp' ? '/api/export/excel/mcp' : `/api/export/excel?session_id=${sessionId}`}
+              download
+              className="flex items-center gap-4 p-5 rounded-2xl border border-green-500/30 bg-green-500/5 hover:bg-green-500/10 transition-all group"
+            >
+              <div className="w-12 h-12 rounded-xl bg-green-500/15 border border-green-500/30 flex items-center justify-center text-2xl flex-shrink-0">📊</div>
+              <div>
+                <p className="text-sm font-semibold text-green-400">Download Excel</p>
+                <p className="text-xs text-dim mt-0.5">.xlsx · Per-requirement sheets + summary</p>
+              </div>
+              <span className="ml-auto text-green-400/60 group-hover:text-green-400 transition-colors text-lg">↓</span>
+            </a>
+
+            <a
+              href={exportSource === 'mcp' ? '/api/export/docx/mcp' : `/api/export/docx?session_id=${sessionId}`}
+              download
+              className="flex items-center gap-4 p-5 rounded-2xl border border-blue-500/30 bg-blue-500/5 hover:bg-blue-500/10 transition-all group"
+            >
+              <div className="w-12 h-12 rounded-xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center text-2xl flex-shrink-0">📄</div>
+              <div>
+                <p className="text-sm font-semibold text-blue-400">Download Word</p>
+                <p className="text-xs text-dim mt-0.5">.docx · Formatted test case document</p>
+              </div>
+              <span className="ml-auto text-blue-400/60 group-hover:text-blue-400 transition-colors text-lg">↓</span>
+            </a>
+          </div>
+
+          {/* Source note */}
+          <p className="text-xs text-dim">
+            {exportSource === 'mcp' ? '✦ Exporting Claude AI results' : '⚙ Exporting rule-based results'} · {testCases.length} test cases
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ─── main App ─────────────────────────────────────────────────────────────────
+
+const TABS = ['upload', 'configure', 'generate', 'export']
+const TAB_LABELS = { upload: 'Upload', configure: 'Configure', generate: 'Generate', export: 'Export' }
+
+export default function App() {
+  const [tab, setTab] = useState('upload')
+
+  // Upload
+  const [files,    setFiles]    = useState({ srs: null, icd: null, supporting: null })
+  const [loading,  setLoading]  = useState({ srs: false, icd: false, supporting: false })
+  const [errors,   setErrors]   = useState({ srs: '', icd: '', supporting: '' })
+  const [sessions, setSessions] = useState({ srs: null, icd: null, supporting: null })
+  const [uploadData, setUploadData] = useState(null)
+
+  const sessionsRef = useRef(sessions)
+  sessionsRef.current = sessions
+
+  // Config
+  const [scopeConfig,     setScopeConfig]     = useState({ selectedReqIds: null, selectedModule: null })
+  const [reviewPoints,    setReviewPoints]    = useState(DEFAULT_RP)
+  const [customReviewPoints, setCustomReviewPoints] = useState([])
+
+  // Generation
+  const [generating, setGenerating] = useState(false)
+  const [testCases,  setTestCases]  = useState([])
+  const [summary,    setSummary]    = useState(null)
+  const [error,      setError]      = useState('')
+  const [progress,   setProgress]   = useState('')
+
+  // MCP
+  const [mode,         setMode]         = useState({ mode: 'offline' })
   const [mcpAvailable, setMcpAvailable] = useState(false)
   const [mcpResults,   setMcpResults]   = useState(null)
   const [aiWaiting,    setAiWaiting]    = useState(false)
-  const [exportSource, setExportSource] = useState('session') // 'session' | 'mcp'
+  const [exportSource, setExportSource] = useState('session')
 
-  // ── Claude AI instructions modal state ───────────────────────────────────
   const [showModal,    setShowModal]    = useState(false)
   const [modalChunks,  setModalChunks]  = useState(0)
-  const [dontAskAgain, setDontAskAgain] = useState(() => localStorage.getItem('claudeModalDismissed') === 'true')
+  const [dontAskAgain, setDontAskAgain] = useState(
+    () => localStorage.getItem('claudeModalDismissed') === 'true'
+  )
 
-  // ── Fetch engine mode on startup ─────────────────────────────────────────
   useEffect(() => {
-    fetch('/api/mode')
-      .then(r => r.ok ? r.json() : null)
-      .then(data => { if (data) setMode(data) })
-      .catch(() => {})
+    fetch('/api/mode').then(r => r.ok ? r.json() : null).then(d => { if (d) setMode(d) }).catch(() => {})
   }, [])
 
-  // ── Poll for Claude Desktop results every 3 seconds ──────────────────────
   useEffect(() => {
-    const poll = setInterval(() => {
-      fetch('/api/mcp/latest')
-        .then(r => r.ok ? r.json() : null)
-        .then(data => {
-          if (data && data.available && data.test_cases?.length > 0) {
-            setMcpAvailable(true)
-            setMcpResults(data)
-            setAiWaiting(false)
-          }
-        })
-        .catch(() => {})
+    const id = setInterval(() => {
+      fetch('/api/mcp/latest').then(r => r.ok ? r.json() : null).then(data => {
+        if (data?.available && data.test_cases?.length > 0) {
+          setMcpAvailable(true); setMcpResults(data); setAiWaiting(false)
+        }
+      }).catch(() => {})
     }, 3000)
-    return () => clearInterval(poll)
+    return () => clearInterval(id)
   }, [])
 
-  const handleRpChange = (id, val) =>
-    setReviewPoints(rp => ({ ...rp, [id]: val }))
+  // ── upload ──────────────────────────────────────────────────────────────────
+  const handleFile = useCallback(async (type, f) => {
+    if (!f) return
+    const ext = '.' + f.name.split('.').pop().toLowerCase()
+    if (!ACCEPTED.includes(ext)) {
+      setErrors(e => ({ ...e, [type]: `Unsupported: ${ext}` })); return
+    }
+    setErrors(e => ({ ...e, [type]: '' }))
+    setFiles(fs => ({ ...fs, [type]: f }))
+    setLoading(ld => ({ ...ld, [type]: true }))
+    const form = new FormData(); form.append('file', f); form.append('doc_type', type)
+    try {
+      const res  = await fetch('/api/upload', { method: 'POST', body: form })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data?.detail?.error || 'Upload failed')
+      const next = { ...sessionsRef.current, [type]: data }
+      setSessions(next)
+      if (next.srs) {
+        setUploadData({
+          ...next.srs,
+          icd_session_id:        next.icd?.session_id        || null,
+          supporting_session_id: next.supporting?.session_id || null,
+        })
+        if (type === 'srs') { setTestCases([]); setSummary(null); setError('') }
+      }
+    } catch (e) {
+      setErrors(err => ({ ...err, [type]: e.message }))
+      setFiles(fs => ({ ...fs, [type]: null }))
+    } finally {
+      setLoading(ld => ({ ...ld, [type]: false }))
+    }
+  }, [])
 
-  // ── Rule-based generation ─────────────────────────────────────────────────
+  const handleClear = (type) => {
+    setFiles(fs => ({ ...fs, [type]: null }))
+    setSessions(s => ({ ...s, [type]: null }))
+    setErrors(e => ({ ...e, [type]: '' }))
+    if (type === 'srs') { setUploadData(null); setTestCases([]); setSummary(null) }
+  }
+
+  // ── generate ────────────────────────────────────────────────────────────────
   const handleGenerate = async () => {
     if (!uploadData?.session_id) return
-    setGenerating(true)
-    setError('')
-    setTestCases([])
-    setSummary(null)
+    setGenerating(true); setError(''); setTestCases([]); setSummary(null)
     setProgress('Analysing document…')
-
     try {
       setProgress('Ingesting requirements…')
+      console.log('[GENERATE] _scope =', JSON.stringify(_scope))
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id:            uploadData.session_id,
           review_points:         reviewPoints,
-          icd_session_id:        uploadData.icd_session_id || null,
+          custom_review_points:  customReviewPoints.map(p => p.label),
+          icd_session_id:        uploadData.icd_session_id        || null,
           supporting_session_id: uploadData.supporting_session_id || null,
+          // Read _scope directly — module-level var, never stale
+          selected_req_ids:      Array.isArray(_scope.selectedReqIds) && _scope.selectedReqIds.length > 0
+                                   ? _scope.selectedReqIds : null,
+          selected_module:       _scope.selectedModule || null,
         }),
       })
       const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data?.detail?.error || data?.detail || 'Generation failed')
-      }
-      setProgress('Applying deduplication…')
-      setTestCases(data.test_cases)
-      setSummary(data.summary)
-      setExportSource('session')
+      if (!res.ok) throw new Error(data?.detail?.error || data?.detail || 'Generation failed')
+      setTestCases(data.test_cases); setSummary(data.summary)
+      setExportSource('session'); setTab('generate')
     } catch (e) {
-      setError(e.message)
+      setError(e.message); setTab('generate')
     } finally {
-      setGenerating(false)
-      setProgress('')
+      setGenerating(false); setProgress('')
     }
   }
 
-  // ── Claude AI generation (Claude Desktop via MCP) ────────────────────────
-  // This handler is EXCLUSIVELY for the "Generate Test Cases using Claude AI"
-  // button. It calls /api/generate/ai which queues requirement chunks for
-  // Claude Desktop — the rule-based engine is never invoked here.
   const handleClaudeGenerate = async () => {
     if (!uploadData?.session_id) return
-    setError('')
-    setTestCases([])
-    setSummary(null)
-
+    setError(''); setTestCases([]); setSummary(null)
     try {
-      // Queue the document for Claude AI via the dedicated AI endpoint
-      const queueRes = await fetch('/api/generate/ai', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
+      const qRes = await fetch('/api/generate/ai', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           session_id:            uploadData.session_id,
           icd_session_id:        uploadData.icd_session_id        || null,
           supporting_session_id: uploadData.supporting_session_id || null,
+          // Read _scope directly — module-level var, never stale
+          selected_req_ids:      Array.isArray(_scope.selectedReqIds) && _scope.selectedReqIds.length > 0
+                                   ? _scope.selectedReqIds : null,
+          selected_module:       _scope.selectedModule || null,
         }),
       })
-      const queueData = await queueRes.json()
-      if (!queueRes.ok) {
-        setError(queueData?.detail?.suggestion || queueData?.detail || 'Failed to queue for Claude AI')
-        return
-      }
-
-      const totalChunks = queueData.total_chunks ?? 0
-      if (totalChunks === 0) {
-        setError('No requirements found in the document.')
-        return
-      }
-
-      // Build the Claude Desktop prompt — instructs Claude to generate test
-      // cases from scratch using the NLP context returned by get_generated_test_cases.
+      const qData = await qRes.json()
+      if (!qRes.ok) { setError(qData?.detail?.suggestion || 'Failed to queue'); return }
+      const total = qData.total_chunks ?? 0
+      if (!total) { setError('No requirements found.'); return }
+      setModalChunks(total)
+      const customPointLines = customReviewPoints.length > 0
+        ? [
+            '',
+            'ADDITIONAL REVIEW POINTS (apply these during test case generation):',
+            ...customReviewPoints.map((p, i) => `  ${i + 1}. ${p.label}`),
+          ]
+        : []
       const prompt = [
         'Generate test cases for my SRS document using tc-tool.',
-        '',
-        'Follow these steps EXACTLY:',
-        '',
-        'STEP 1: Call tc-tool get_generated_test_cases',
-        'This returns NLP-extracted context (sentences, subjects, actions,',
-        'testing types, priorities, and methodologies) for each requirement.',
-        'Use this context as your input — do NOT copy it as output.',
-        '',
-        'STEP 2: For each requirement in the context, generate test cases',
-        'covering ALL FOUR scenario types: normal, boundary, edge, robustness.',
-        'Author every field from scratch using the NLP context as your guide:',
-        '  - traceability_req_id : use requirement_id from context exactly',
-        '  - test_case_id        : TC_VD_001 (validation) / TC_IT_001 (integration) / TC_UT_001 (verification); one ID per requirement',
-        '  - scenario_id         : SC_001, SC_002, SC_003, SC_004 — reset per requirement',
-        '  - priority            : use scenario_priorities[scenario_type] from context',
-        '  - module              : use module from context exactly',
-        '  - requirement_type    : use requirement_type from context (functional or non-functional)',
-        '  - scenario_type       : normal | boundary | edge | robustness',
-        '  - testing_type        : use testing_type from context',
-        '  - test_environment    : use test_environment from context',
-        '  - design_methodology  : use scenario_methodologies[scenario_type] from context',
-        '  - dependent_test_cases: "None" for SC_001; "TC_XX_NNN_SC-001" for all others',
-        '  - inputs              : list of realistic test input values for the scenario',
-        '  - objective           : clear, specific — no modal verbs (shall/must/can/will)',
-        '  - preconditions       : list of specific, testable preconditions',
-        '  - test_steps          : list of numbered actionable strings ["1. ...", "2. ..."]',
-        '  - expected_outcome    : MUST start with "ActualSignalName = Value. " using the REAL',
-        '                          output signal name from the requirement (e.g.',
-        '                          "Altitude Alert Condition Enabled = True. System sets output.").',
-        '                          normal/boundary → True/Enabled/Active.',
-        '                          edge/robustness → False/Disabled/Inactive.',
-        '                          NEVER write "Output signal", "output", or any generic placeholder.',
-        '  - inputs              : list of strings in "SignalName: Value" format using the REAL',
-        '                          signal names from the requirement (e.g. "Tail Low Condition: True")',
-        '  - remarks             : risk, compliance, ambiguity, or coverage observations',
-        '',
-        'STEP 3: Call tc-tool save_enhanced_test_cases with the complete list.',
-        '',
-        'IMPORTANT RULES:',
-        '  - No modal verbs anywhere in objective, test_steps, or expected_outcome',
-        '  - test_steps must be an array of numbered strings: ["1. Do X", "2. Do Y"]',
-        '  - preconditions must be an array of strings',
-        '  - inputs must be an array of strings in "SignalName: Value" format',
-        '  - expected_outcome must start with the real signal name, not a generic placeholder',
-        '  - You MUST call save_enhanced_test_cases — do not just show results in chat',
-        `Total requirements queued: ${totalChunks}`,
+        '', 'STEP 1: Call tc-tool get_generated_test_cases',
+        '', 'STEP 2: For each requirement generate test cases: normal, boundary, edge, robustness.',
+        'Every test case MUST have: traceability_req_id, test_case_id, scenario_id,',
+        'inputs (["SignalName = Value"]), expected_outcome ("OutputSignal = Value."),',
+        'design_methodology, testing_type, scenario_type, priority, objective,',
+        'preconditions, test_steps, dependent_test_cases, test_environment, remarks, module',
+        ...customPointLines,
+        '', 'STEP 3: Call tc-tool save_enhanced_test_cases with ALL test cases.',
+        '', `Total requirements: ${total}`,
       ].join('\n')
-
-      try {
-        await navigator.clipboard.writeText(prompt)
-      } catch {
-        const ta = document.createElement('textarea')
-        ta.value = prompt
-        document.body.appendChild(ta)
-        ta.select()
-        document.execCommand('copy')
-        document.body.removeChild(ta)
-      }
-
+      await navigator.clipboard.writeText(prompt).catch(() => {})
       setAiWaiting(true)
-      if (!localStorage.getItem('claudeModalDismissed')) {
-        setModalChunks(totalChunks)
-        setShowModal(true)
-      }
-    } catch (e) {
-      setError('Failed to queue for Claude AI: ' + e.message)
-    }
+      setShowModal(true)   // always show steps popup when user selects Claude AI
+      setTab('generate')
+    } catch (e) { setError(e.message) }
   }
 
-  const handleRemindClaude = () => {
-    const msg = [
-      'IMPORTANT: You must call tc-tool save_enhanced_test_cases NOW.',
-      '',
-      'Pass the complete list of ALL test cases you generated,',
-      'with every field populated as instructed.',
-      '',
-      'The React UI at localhost:5173 is waiting for save_enhanced_test_cases.',
-      'Do NOT just show results in chat — you must call the tool.',
-    ].join('\n')
-
-    navigator.clipboard.writeText(msg).catch(() => {
-      const ta = document.createElement('textarea')
-      ta.value = msg
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    })
-    alert('Reminder copied — paste into Claude Desktop and press Enter.')
-  }
-
-  const handleLoadMcpResults = () => {
+  const handleLoadMcp = () => {
     if (!mcpResults) return
-    setTestCases(mcpResults.test_cases)
-    setSummary(mcpResults.summary)
-    setMcpAvailable(false)
-    setExportSource('mcp')
-    window.scrollTo({ top: 0, behavior: 'smooth' })
+    setTestCases(mcpResults.test_cases); setSummary(mcpResults.summary)
+    setMcpAvailable(false); setExportSource('mcp')
   }
 
-  const handleModalOk = (checked) => {
-    if (checked) localStorage.setItem('claudeModalDismissed', 'true')
-    setShowModal(false)
+  const handleRemindClaude = async () => {
+    await navigator.clipboard.writeText('Please call tc-tool save_enhanced_test_cases now.').catch(() => {})
   }
 
-  const sessionId = uploadData?.session_id
-  const isMcp     = mode?.mode === 'online'
+  // tab accessibility
+  const tabAllowed = (t) => {
+    if (t === 'upload') return true
+    if (t === 'configure' || t === 'generate' || t === 'export') return !!uploadData
+    return false
+  }
+
+  const isMcp = mode?.mode === 'online'
 
   return (
-    <div className="min-h-screen bg-bg text-text font-sans">
+    <div className="h-screen flex flex-col bg-bg text-text font-sans overflow-hidden">
 
-      {/* Claude AI Instructions Modal */}
+      {/* Claude modal */}
       {showModal && (
-        <ClaudeModal
-          chunks={modalChunks}
-          onOk={handleModalOk}
-        />
-      )}
-
-      {/* Header */}
-      <header className="border-b border-border bg-surface sticky top-0 z-50">
-        <div className="max-w-screen-2xl mx-auto px-6 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center">
-              <span className="text-amber text-sm">⚙</span>
-            </div>
-            <div>
-              <h1 className="text-sm font-semibold text-text leading-none">Test Case Generator</h1>
-              <p className="text-[10px] text-dim font-mono">Rule-Based NLP · No API · No LLM</p>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-surface border border-border rounded-2xl shadow-2xl w-80 mx-4 p-5">
+            <p className="text-sm font-semibold mb-2">{modalChunks} requirement(s) queued!</p>
+            <ol className="text-xs text-dim space-y-1 mb-4 list-decimal list-inside">
+              <li>Open Claude Desktop</li><li>Start a New Chat</li>
+              <li>Press Ctrl+V to paste</li><li>Press Enter</li>
+            </ol>
+            <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
+              <input type="checkbox" checked={dontAskAgain}
+                onChange={e => setDontAskAgain(e.target.checked)}
+                className="accent-amber w-3.5 h-3.5 cursor-pointer" />
+              <span className="text-xs text-dim">Don't show again</span>
+            </label>
+            <div className="flex justify-end">
+              <button onClick={() => {
+                if (dontAskAgain) localStorage.setItem('claudeModalDismissed', 'true')
+                setShowModal(false)
+              }} className="px-4 py-1.5 rounded-lg bg-amber text-bg text-sm font-semibold">OK</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── Top bar ── */}
+      <header className="flex-shrink-0 border-b border-border bg-surface z-10">
+        <div className="flex items-center h-12 px-5 justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">⚙</div>
+            <div>
+              <p className="text-xs font-semibold text-text leading-none">Test Case Generator</p>
+              <p className="text-[10px] text-dim font-mono">Rule-Based NLP</p>
+            </div>
+          </div>
+
+          {/* Tab navigation */}
+          <nav className="flex items-center">
+            {TABS.map((t, i) => {
+              const allowed  = tabAllowed(t)
+              const isActive = tab === t
+              const isDone   = (t === 'upload' && !!uploadData) ||
+                               (t === 'configure' && !!uploadData) ||
+                               (t === 'generate' && testCases.length > 0) ||
+                               (t === 'export'   && testCases.length > 0)
+              return (
+                <div key={t} className="flex items-center">
+                  <button
+                    onClick={() => allowed && setTab(t)}
+                    disabled={!allowed}
+                    className={`flex items-center gap-1.5 px-4 py-3 text-xs border-b-2 transition-all
+                      ${isActive
+                        ? 'border-amber text-text font-medium'
+                        : allowed
+                          ? isDone
+                            ? 'border-transparent text-green-400 hover:border-green-500/40 cursor-pointer'
+                            : 'border-transparent text-dim hover:text-text hover:border-border cursor-pointer'
+                          : 'border-transparent text-dim/40 cursor-not-allowed'}`}
+                  >
+                    <span className={`w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold flex-shrink-0
+                      ${isActive  ? 'bg-amber/20 text-amber'
+                      : isDone    ? 'bg-green-500/20 text-green-400'
+                      : allowed   ? 'bg-surface text-dim'
+                      :             'bg-surface/50 text-dim/40'}`}>
+                      {isDone && !isActive ? '✓' : i + 1}
+                    </span>
+                    {TAB_LABELS[t]}
+                  </button>
+                  {i < TABS.length - 1 && (
+                    <span className="text-border/60 text-xs px-0.5">›</span>
+                  )}
+                </div>
+              )
+            })}
+          </nav>
+
           <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full inline-block ${isMcp ? 'bg-green-400' : 'bg-amber-400'}`} />
-            <span className="text-xs text-dim font-mono">
-              {isMcp ? 'AI Mode — Claude Desktop' : 'Offline Mode — Rule-Based'}
-            </span>
+            <span className={`w-1.5 h-1.5 rounded-full ${isMcp ? 'bg-green-400' : 'bg-amber'}`} />
+            <span className="text-[11px] text-dim font-mono">{isMcp ? 'AI Mode' : 'Offline'}</span>
           </div>
         </div>
       </header>
 
-      <div className="max-w-screen-2xl mx-auto px-6 py-8 space-y-8">
+      {/* ── Tab content ── */}
+      <div className="flex-1 overflow-auto">
 
-        {/* Claude Desktop Results Banner */}
-        {mcpAvailable && mcpResults && (
-          <div className="bg-card border border-amber/40 rounded-2xl p-5 flex items-center justify-between flex-wrap gap-4">
-            <div className="flex items-center gap-3">
-              <span className="text-amber text-xl">✦</span>
-              <div>
-                <p className="text-sm font-semibold text-text">Claude Desktop Results Ready</p>
-                <p className="text-xs text-dim mt-0.5">
-                  {mcpResults.timestamp} · {mcpResults.summary?.total ?? mcpResults.test_cases?.length} test cases generated
-                </p>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-3">
-              <button
-                onClick={handleLoadMcpResults}
-                className="px-4 py-2 rounded-xl text-sm font-semibold bg-amber text-bg hover:bg-amber/90 transition-all"
-              >
-                Load Results
-              </button>
-              <a href="/api/export/excel/mcp" download
-                className="px-4 py-2 rounded-xl text-sm font-medium border border-green-500/40 text-green-400 bg-green-500/10 hover:bg-green-500/20 transition-all">
-                📥 Download Excel
-              </a>
-              <a href="/api/export/docx/mcp" download
-                className="px-4 py-2 rounded-xl text-sm font-medium border border-blue-500/40 text-blue-400 bg-blue-500/10 hover:bg-blue-500/20 transition-all">
-                📄 Download Word
-              </a>
-            </div>
-          </div>
+        {tab === 'upload' && (
+          <PageUpload
+            files={files} loading={loading} errors={errors}
+            onFile={handleFile} onClear={handleClear}
+            onNext={() => setTab('configure')}
+          />
         )}
 
-        {/* Top grid: upload + review points + generate */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {tab === 'configure' && (
+          <PageConfigure
+            sessionId={uploadData?.session_id}
+            scopeConfig={scopeConfig}    onScopeChange={setScopeConfig}
+            reviewPoints={reviewPoints}  onRpChange={(id, v) => setReviewPoints(rp => ({ ...rp, [id]: v }))}
+            customReviewPoints={customReviewPoints} onCustomReviewPointsChange={setCustomReviewPoints}
+            generating={generating}
+            onBack={() => setTab('upload')}
+            onGenerate={handleGenerate}
+            onNext={() => setTab('generate')}
+          />
+        )}
 
-          {/* Upload */}
-          <div className="bg-card border border-border rounded-2xl p-6">
-            <UploadPanel onUploaded={setUploadData} />
-          </div>
-
-          {/* Review points + generate */}
-          <div className="bg-card border border-border rounded-2xl p-6 flex flex-col gap-6">
-            <ReviewPointsPanel
-              reviewPoints={reviewPoints}
-              onChange={handleRpChange}
-              disabled={generating}
+        {tab === 'generate' && (
+          <div className="flex flex-col" style={{ height: 'calc(100vh - 48px)' }}>
+            <PageGenerate
+              testCases={testCases} summary={summary}
+              generating={generating} progress={progress} error={error} aiWaiting={aiWaiting}
+              uploadDone={!!uploadData}
+              onGenerate={handleGenerate}
+              onClaudeGenerate={handleClaudeGenerate}
+              onRemindClaude={handleRemindClaude}
+              onLoadMcp={handleLoadMcp}
+              mcpAvailable={mcpAvailable} mcpResults={mcpResults}
+              onExport={() => setTab('export')}
             />
-
-            {/* Step 3 — Generate */}
-            <div>
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-7 h-7 rounded bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-sm font-mono font-bold">3</div>
-                <h2 className="text-base font-semibold text-text">Generate</h2>
-              </div>
-
-              {/* Rule-based button */}
-              <button
-                onClick={handleGenerate}
-                disabled={!uploadData || generating}
-                className={`w-full py-3 rounded-xl font-semibold text-sm transition-all flex items-center justify-center gap-2
-                  ${!uploadData || generating
-                    ? 'bg-border text-muted cursor-not-allowed'
-                    : 'bg-amber hover:bg-amber2 text-bg cursor-pointer shadow-lg shadow-amber/20'
-                  }`}
-              >
-                {generating ? (
-                  <>
-                    <div className="w-4 h-4 border-2 border-bg border-t-transparent rounded-full spin" />
-                    {progress || 'Generating…'}
-                  </>
-                ) : (
-                  <>⚙ Generate Test Cases</>
-                )}
-              </button>
-
-              {/* Claude AI button */}
-              {uploadData && !generating && (
-                <button
-                  onClick={handleClaudeGenerate}
-                  className="w-full py-2.5 rounded-xl text-sm font-medium border border-amber/30 text-amber hover:bg-amber/10 transition-all mt-2 flex items-center justify-center gap-2"
-                >
-                  <span>✦</span>
-                  <span>Generate with Claude AI</span>
-                </button>
-              )}
-
-              {/* Waiting for Claude spinner */}
-              {aiWaiting && (
-                <div className="mt-3 rounded-xl bg-amber/5 border border-amber/20 overflow-hidden">
-                  <div className="px-4 py-3 flex items-center gap-3">
-                    <div className="w-4 h-4 border-2 border-amber border-t-transparent rounded-full spin flex-shrink-0" />
-                    <div>
-                      <p className="text-sm text-amber font-medium">Waiting for Claude AI…</p>
-                      <p className="text-xs text-dim mt-0.5">
-                        Paste the prompt into Claude Desktop and press Enter.
-                        Results appear here automatically.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="border-t border-amber/10 px-4 py-2">
-                    <button
-                      onClick={handleRemindClaude}
-                      className="text-xs text-dim hover:text-amber transition-colors"
-                    >
-                      Claude showed results in chat but UI not updated? Click here →
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {!uploadData && (
-                <p className="text-center text-xs text-muted mt-2">Upload a document first</p>
-              )}
-
-              {error && (
-                <div className="mt-3 px-4 py-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
-                  ⚠ {error}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Summary */}
-        {summary && (
-          <div className="bg-card border border-border rounded-2xl p-6">
-            <SummaryBar summary={summary} />
           </div>
         )}
 
-        {/* Export buttons */}
-        {testCases.length > 0 && (
-          <div className="bg-card border border-border rounded-2xl p-6">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-7 h-7 rounded bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-sm font-mono font-bold">5</div>
-              <h2 className="text-base font-semibold text-text">Export</h2>
-            </div>
-            <div className="flex flex-wrap gap-3">
-              <ExportButton
-                label="📥 Download Excel (.xlsx)"
-                href={exportSource === 'mcp' ? '/api/export/excel/mcp' : `/api/export/excel?session_id=${sessionId}`}
-                disabled={exportSource === 'session' && !sessionId}
-                color="green"
-              />
-              <ExportButton
-                label="📄 Download Word (.docx)"
-                href={exportSource === 'mcp' ? '/api/export/docx/mcp' : `/api/export/docx?session_id=${sessionId}`}
-                disabled={exportSource === 'session' && !sessionId}
-                color="blue"
-              />
-            </div>
-            <p className="text-xs text-dim mt-2">
-              {exportSource === 'mcp' ? '✦ Exporting Claude AI results' : '⚙ Exporting rule-based results'}
-            </p>
-          </div>
+        {tab === 'export' && (
+          <PageExport
+            testCases={testCases} summary={summary}
+            sessionId={uploadData?.session_id}
+            exportSource={exportSource}
+          />
         )}
-
-        {/* Results table */}
-        {testCases.length > 0 && (
-          <div className="bg-card border border-border rounded-2xl p-6">
-            <ResultsTable testCases={testCases} />
-          </div>
-        )}
-
       </div>
     </div>
   )
