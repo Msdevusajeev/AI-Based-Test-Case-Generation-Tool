@@ -1,14 +1,35 @@
 import logging
+import os
 import re
+import sys
+import threading
 import traceback
 import uuid
+import webbrowser
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+# ── Fix: when frozen (console=False) stdout/stderr are None ──────────────────
+# Redirect them to a log file so uvicorn logging doesn't crash with
+# AttributeError: 'NoneType' object has no attribute 'isatty'
+if getattr(sys, 'frozen', False):
+    _log_path = os.path.join(os.path.dirname(sys.executable), 'TestCaseGenerator.log')
+    _log_file = open(_log_path, 'w', buffering=1, encoding='utf-8')
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+
+# ── Resolve paths whether running as .py or as a PyInstaller .exe ────────────
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys._MEIPASS)
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 
 from models import (
     UploadResponse, GenerateRequest, GenerateResponse,
@@ -126,9 +147,9 @@ def _normalise_mcp_tc(raw: dict) -> dict:
     else:                                             tc["requirement_type"] = "functional"
 
     st = str(tc.get("scenario_type", "normal")).lower()
-    if   "bound" in st:                              tc["scenario_type"] = "boundary"
-    elif "edge"  in st or "corner" in st:            tc["scenario_type"] = "edge"
-    elif "robust" in st or "negative" in st:         tc["scenario_type"] = "robustness"
+    if   "bound"   in st:                            tc["scenario_type"] = "boundary"
+    elif "edge"    in st or "corner" in st:          tc["scenario_type"] = "edge"
+    elif "robust"  in st or "negative" in st:        tc["scenario_type"] = "robustness"
     else:                                             tc["scenario_type"] = "normal"
 
     tt = str(tc.get("testing_type", "verification")).lower()
@@ -249,7 +270,7 @@ def debug_chunks(session_id: str = Query(...)):
                 "chunk_index":      c.chunk_index,
                 "requirement_id":   c.requirement_ids[0] if c.requirement_ids else "REQ-001",
                 "requirement_ids":  c.requirement_ids,
-                "module":           c.module,
+                "module":           c.module or "General",
                 "requirement_type": c.requirement_type,
                 "content":          c.content,
                 "content_preview":  c.content[:150],
@@ -321,10 +342,11 @@ async def upload(file: UploadFile = File(...), doc_type: str = "srs"):
 # ─── GENERATE ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/scope")
-def get_scope(session_id: str = Query(...)):
+def get_scope(session_id: str = Query(...), req_prefixes: str = Query(default="")):
     """
-    Returns every unique requirement ID and module name found in the
-    uploaded document so the frontend can populate the scope selector.
+    Returns requirement IDs and modules found in the uploaded SRS document.
+    If req_prefixes is provided (comma-separated), only IDs matching those
+    prefixes are returned — this is what populates the Configure tab scope list.
     """
     session = sessions.get(session_id)
     if not session:
@@ -332,6 +354,15 @@ def get_scope(session_id: str = Query(...)):
 
     text   = session.get("text", "")
     chunks = ingest_document(text)
+
+    # Apply prefix filter if provided
+    prefixes = [p.strip() for p in req_prefixes.split(",") if p.strip()] if req_prefixes else []
+    if prefixes:
+        before = len(chunks)
+        chunks = [c for c in chunks
+                  if c.requirement_ids and
+                  any(c.requirement_ids[0].startswith(px) for px in prefixes)]
+        logger.info(f"[SCOPE-FILTER] prefixes={prefixes} → {before} → {len(chunks)} chunks")
 
     req_ids: list = []
     modules: list = []
@@ -376,7 +407,9 @@ def generate(request: GenerateRequest):
         if supporting_text:
             combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
 
-        chunks = ingest_document(combined_text, CHUNK_SIZE_WORDS)
+        # Ingest SRS ONLY — ICD/supporting text contains identifiers that
+        # confuse the parser and create phantom requirement chunks.
+        chunks = ingest_document(text, CHUNK_SIZE_WORDS)
 
         # ── Scope filter ─────────────────────────────────────────────────────
         # If the user selected specific requirement IDs, keep only those chunks.
@@ -385,6 +418,7 @@ def generate(request: GenerateRequest):
                     f"selected_module={request.selected_module!r}  "
                     f"total_chunks={len(chunks)}")
 
+        # IMPORTANT: use `is not None` — empty list [] is falsy in Python
         if request.selected_req_ids is not None:
             keep   = set(request.selected_req_ids)
             before = len(chunks)
@@ -463,6 +497,16 @@ def generate(request: GenerateRequest):
         )
 
 
+
+# ── DEBUG: store last AI generate request ────────────────────────────────────
+_last_ai_request: dict = {}
+
+@app.get("/api/debug/last-request")
+async def debug_last_request():
+    """Shows what the last /api/generate/ai call received."""
+    return _last_ai_request
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─── GENERATE (Claude AI) ─────────────────────────────────────────────────────
 
 @app.post("/api/generate/ai")
@@ -481,6 +525,22 @@ async def generate_ai(request: Request):
     try:
         data       = await request.json()
         session_id = data.get("session_id")
+
+        # ── DEBUG: store and log incoming payload ─────────────────────────
+        _last_ai_request.clear()
+        _last_ai_request.update({
+            "keys":        list(data.keys()),
+            "req_prefixes": data.get("req_prefixes"),
+            "session_id":  session_id,
+        })
+        logger.info(
+            f"[AI-ENDPOINT] incoming keys={list(data.keys())} | "
+            f"req_prefixes={data.get('req_prefixes')!r} | "
+            f"selected_req_ids={data.get('selected_req_ids')!r} | "
+            f"session_id={session_id!r}"
+        )
+        # ─────────────────────────────────────────────────────────────────
+
         if not session_id:
             raise HTTPException(status_code=400, detail="session_id is required")
 
@@ -506,11 +566,25 @@ async def generate_ai(request: Request):
         if supporting_text:
             combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
 
-        chunks = ingest_document(combined_text, CHUNK_SIZE_WORDS)
+        # Ingest SRS ONLY — ICD/supporting text contains identifiers that
+        # confuse the parser and create phantom requirement chunks.
+        chunks = ingest_document(text, CHUNK_SIZE_WORDS)
 
-        # ── Scope filter (same logic as /api/generate) ────────────────────────
+        # ── Scope filter for Claude AI (same logic as rule-based) ─────────────
         selected_req_ids = data.get("selected_req_ids")   # list or None
         selected_module  = data.get("selected_module")    # str or None
+
+        # ── Requirement ID prefix filter ─────────────────────────────────
+        req_prefixes = data.get("req_prefixes") or []
+        if req_prefixes:
+            prefixes = [p.strip() for p in req_prefixes if p.strip()]
+            if prefixes:
+                before_pf = len(chunks)
+                chunks = [c for c in chunks
+                          if c.requirement_ids and
+                          any(c.requirement_ids[0].startswith(px) for px in prefixes)]
+                logger.info(f"[PREFIX/AI] {prefixes} → {before_pf} → {len(chunks)} chunks")
+        # ─────────────────────────────────────────────────────────────────
 
         logger.info(f"[SCOPE/AI] selected_req_ids={selected_req_ids!r}  "
                     f"selected_module={selected_module!r}  "
@@ -519,8 +593,9 @@ async def generate_ai(request: Request):
         if selected_req_ids is not None:
             keep   = set(selected_req_ids)
             before = len(chunks)
+            # Keep chunk if ANY of its requirement IDs is in the selected set
             chunks = [c for c in chunks
-                      if any(rid in keep for rid in c.requirement_ids)]
+                      if any(rid in keep for rid in (c.requirement_ids or []))]
             logger.info(f"[SCOPE/AI] req filter → {before} → {len(chunks)} chunks | keep={keep}")
         elif selected_module and selected_module != "__all__":
             before = len(chunks)
@@ -540,15 +615,20 @@ async def generate_ai(request: Request):
                 },
             )
 
-        chunk_data = [
-            {
-                "requirement_id":   c.requirement_ids[0] if c.requirement_ids else "REQ-001",
+        # Expand: one entry per requirement ID so Claude gets context for EVERY
+        # requirement even when multiple reqs share the same module/chunk.
+        # Use _extract_req_content to isolate each requirement's text so
+        # signals and conditions from sibling requirements don't bleed through.
+        chunk_data = []
+        for c in chunks:
+            # Use ONLY the primary ID — body-text cross-references inflate the count
+            req_id = c.requirement_ids[0] if c.requirement_ids else "REQ-001"
+            chunk_data.append({
+                "requirement_id":   req_id,
                 "content":          c.content,
-                "module":           c.module,
+                "module":           c.module or "General",
                 "requirement_type": c.requirement_type,
-            }
-            for c in chunks
-        ]
+            })
 
         # Store chunks in session for reference and queue for Claude AI
         sessions[session_id]["chunks"] = chunks
@@ -635,7 +715,7 @@ def get_mcp_latest():
 @app.post("/api/mcp/save")
 async def save_mcp_results(request: Request):
     """Called by mcp_server.py after Claude Desktop generates test cases.
-    Stores results so React UI can display and download them."""
+    Stores results so React UI can display and download them"""
     data = await request.json()
     mcp_results_store["test_cases"] = data.get("test_cases", [])
     mcp_results_store["summary"]    = data.get("summary", {})
@@ -647,18 +727,38 @@ async def save_mcp_results(request: Request):
 
 @app.get("/api/export/excel/mcp")
 def export_mcp_excel():
-    """Exports Claude Desktop MCP results as Excel."""
+    """Exports Claude Desktop MCP results as Excel"""
     if not mcp_results_store["test_cases"]:
-        raise HTTPException(status_code=404, detail="No MCP results available")
+        raise HTTPException(status_code=404,
+            detail="No results found. Generate test cases with Claude first, then click Load Results.")
     from models import TestCase
     try:
-        test_cases = [TestCase(**_normalise_mcp_tc(tc)) for tc in mcp_results_store["test_cases"]]
+        DEFAULTS = {
+            "traceability_req_id": "", "test_case_id": "", "scenario_id": "",
+            "priority": "P2", "objective": "", "preconditions": [],
+            "test_steps": [], "inputs": [], "design_methodology": "Equivalence Partitioning",
+            "dependent_test_cases": "None", "expected_outcome": "",
+            "test_environment": "Dev", "remarks": "", "module": "General",
+            "requirement_type": "functional", "scenario_type": "normal",
+            "testing_type": "verification",
+        }
+        test_cases = []
+        for raw in mcp_results_store["test_cases"]:
+            merged = {**DEFAULTS, **{k: v for k, v in raw.items() if k in DEFAULTS}}
+            try:
+                test_cases.append(TestCase(**merged))
+            except Exception:
+                logger.warning(f"Skipping malformed test case: {raw.get('test_case_id','?')} — {traceback.format_exc()}")
+        if not test_cases:
+            raise HTTPException(status_code=422, detail="Test cases could not be parsed. Check Claude output format.")
         xlsx_bytes = generate_excel(test_cases, 0)
         return Response(
             content    = xlsx_bytes,
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers    = {"Content-Disposition": "attachment; filename=test_cases_claude.xlsx"},
         )
+    except HTTPException:
+        raise
     except Exception:
         logger.error(f"MCP Excel export error: {traceback.format_exc()}")
         _error("Excel export failed", "export", traceback.format_exc(), "Check server logs.")
@@ -666,18 +766,38 @@ def export_mcp_excel():
 
 @app.get("/api/export/docx/mcp")
 def export_mcp_docx():
-    """Exports Claude Desktop MCP results as Word."""
+    """Exports Claude Desktop MCP results as Word"""
     if not mcp_results_store["test_cases"]:
-        raise HTTPException(status_code=404, detail="No MCP results available")
+        raise HTTPException(status_code=404,
+            detail="No results found. Generate test cases with Claude first, then click Load Results.")
     from models import TestCase
     try:
-        test_cases = [TestCase(**_normalise_mcp_tc(tc)) for tc in mcp_results_store["test_cases"]]
+        DEFAULTS = {
+            "traceability_req_id": "", "test_case_id": "", "scenario_id": "",
+            "priority": "P2", "objective": "", "preconditions": [],
+            "test_steps": [], "inputs": [], "design_methodology": "Equivalence Partitioning",
+            "dependent_test_cases": "None", "expected_outcome": "",
+            "test_environment": "Dev", "remarks": "", "module": "General",
+            "requirement_type": "functional", "scenario_type": "normal",
+            "testing_type": "verification",
+        }
+        test_cases = []
+        for raw in mcp_results_store["test_cases"]:
+            merged = {**DEFAULTS, **{k: v for k, v in raw.items() if k in DEFAULTS}}
+            try:
+                test_cases.append(TestCase(**merged))
+            except Exception:
+                logger.warning(f"Skipping malformed test case: {raw.get('test_case_id','?')} — {traceback.format_exc()}")
+        if not test_cases:
+            raise HTTPException(status_code=422, detail="Test cases could not be parsed. Check Claude output format.")
         docx_bytes = generate_docx(test_cases, 0)
         return Response(
             content    = docx_bytes,
             media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers    = {"Content-Disposition": "attachment; filename=test_cases_claude.docx"},
         )
+    except HTTPException:
+        raise
     except Exception:
         logger.error(f"MCP Word export error: {traceback.format_exc()}")
         _error("Word export failed", "export", traceback.format_exc(), "Check server logs.")
@@ -719,3 +839,106 @@ def get_ai_status():
         "status":   generation_queue["status"],
         "has_data": bool(mcp_results_store.get("test_cases")),
     }
+
+
+# ── Serve React frontend ─────────────────────────────────────────────────────
+# When frozen: check for external frontend/dist next to the EXE first.
+# This lets you update the frontend WITHOUT rebuilding the EXE:
+#   1. npm run build          2. robocopy frontend\dist dist\frontend\dist /E /IS
+#   3. Restart EXE            — changes visible immediately
+if getattr(sys, "frozen", False):
+    _exe_dir = Path(sys.executable).parent
+    _ext     = _exe_dir / "frontend" / "dist"
+    _DIST    = _ext if _ext.exists() else Path(sys._MEIPASS) / "frontend" / "dist"
+else:
+    _DIST = BASE_DIR / "frontend" / "dist"
+
+if _DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(_DIST / "assets")), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index():
+        return FileResponse(str(_DIST / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        file_path = _DIST / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        return FileResponse(str(_DIST / "index.html"))
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def _open_browser():
+    import time
+    time.sleep(2)
+    webbrowser.open("http://localhost:8000")
+
+
+
+def _extract_req_content(req_id: str, full_content: str) -> str:
+    """Extract only the text block belonging to req_id from combined content."""
+    import re
+    escaped = re.escape(req_id)
+    start_m = re.search(rf'(?:^|\n)\s*{escaped}\b', full_content, re.IGNORECASE)
+    if not start_m:
+        return full_content
+    start = start_m.start()
+    next_req = re.search(
+        r'\n\s*(?:[A-Z][A-Z0-9]*[_-][A-Z0-9][A-Z0-9_-]{1,40})(?:\s*:|\s+[Tt]he|\s+shall)',
+        full_content[start + len(req_id):], re.IGNORECASE
+    )
+    if next_req:
+        end = start + len(req_id) + next_req.start()
+        return full_content[start:end].strip()
+    return full_content[start:].strip()
+
+def _find_free_port(preferred: int = 8000) -> int:
+    """Return preferred port if free, otherwise find the next available one."""
+    import socket
+    for port in range(preferred, preferred + 20):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError("No free port found in range 8000-8019")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = _find_free_port(8000)
+
+    # Update browser open URL with the actual port
+    def _open_browser_port():
+        import time
+        time.sleep(2)
+        webbrowser.open(f"http://localhost:{port}")
+
+    log_cfg = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "fmt": "%(asctime)s %(levelname)s %(message)s",
+                "use_colors": False,
+            }
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": "WARNING"},
+            "uvicorn.error": {"level": "WARNING"},
+            "uvicorn.access": {"handlers": ["default"], "level": "WARNING"},
+        },
+    }
+
+    threading.Thread(target=_open_browser_port, daemon=True).start()
+    uvicorn.run(app, host="127.0.0.1", port=port, log_config=log_cfg)

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import ReviewPointsPanel from './components/ReviewPointsPanel'
-import ResultsTable      from './components/ResultsTable'
-import ScopeSelector, { _scope } from './components/ScopeSelector'
+import ResultsTable      from './components/TCTable'
+import ScopeSelector     from './components/ScopeSelector'
 
 const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true }
 const ACCEPTED   = ['.pdf', '.docx', '.xlsx']
@@ -92,7 +92,7 @@ function DropZone({ label, required, file, loading, error, onFile, onClear }) {
 
 // ─── Page: Upload ─────────────────────────────────────────────────────────────
 
-function PageUpload({ files, loading, errors, onFile, onClear, onNext }) {
+function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefixes, onReqPrefixesChange }) {
   const srsReady = !!files.srs
   return (
     <div className="max-w-3xl mx-auto px-6 py-8">
@@ -114,6 +114,40 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext }) {
             onFile={f => onFile('srs', f)} onClear={() => onClear('srs')} />
         </div>
 
+        {/* Requirement ID Prefix */}
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-amber/15 text-amber border border-amber/30">REQ</span>
+            <span className="text-sm text-text font-medium">Requirement ID Prefix</span>
+            <span className="text-xs text-red-400/80 ml-1">* Mandatory</span>
+            <div className="relative group cursor-help ml-1">
+              <span className="text-dim/50 text-xs select-none">ⓘ</span>
+              <div className="absolute left-0 top-5 z-50 hidden group-hover:block w-72 bg-surface border border-border rounded-lg px-3 py-2 text-xs text-dim shadow-xl">
+                Only IDs that start with this prefix are treated as requirements.
+                Stops table labels, figure numbers, and ICD signal names from being picked up.
+                <span className="text-amber/80 block mt-1">e.g. <code className="font-mono text-amber">MRJ_MCU_SRS_</code> or <code className="font-mono text-amber">REQ_</code></span>
+                <span className="text-dim/60 block mt-0.5">Comma-separate for multiple prefixes.</span>
+              </div>
+            </div>
+          </div>
+          <input
+            type="text"
+            value={reqPrefixes}
+            onChange={e => onReqPrefixesChange(e.target.value)}
+            placeholder="e.g.  MRJ_MCU_SRS_    or    REQ_, SYS_REQ_"
+            className="w-full bg-card border border-border rounded-xl px-4 py-3 text-sm text-text font-mono placeholder:text-dim/40 focus:outline-none focus:border-amber/60 transition-colors"
+          />
+          {reqPrefixes.trim() && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {reqPrefixes.split(',').map(p => p.trim()).filter(Boolean).map((p, i) => (
+                <span key={i} className="px-2.5 py-0.5 rounded-full text-xs font-mono bg-amber/10 text-amber border border-amber/25">
+                  {p}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* ICD */}
         <div>
           <div className="flex items-center gap-2 mb-2">
@@ -130,12 +164,56 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext }) {
         <div>
           <div className="flex items-center gap-2 mb-2">
             <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-border text-dim">SUP</span>
-            <span className="text-sm text-text font-medium">Supporting Document</span>
+            <div className="relative group flex items-center gap-1">
+              <span className="text-sm text-text font-medium">Supporting Document</span>
+              <span className="text-dim/50 text-xs cursor-help">ⓘ</span>
+              <div className="absolute left-0 top-6 z-50 hidden group-hover:block bg-surface border border-border rounded-lg px-3 py-2 text-xs text-dim shadow-lg whitespace-nowrap">
+                System document — ICD, test plans, or any reference material
+              </div>
+            </div>
             <span className="text-xs text-dim ml-1">optional</span>
           </div>
-          <DropZone label="supporting document"
-            file={files.supporting} loading={loading.supporting} error={errors.supporting}
-            onFile={f => onFile('supporting', f)} onClear={() => onClear('supporting')} />
+          {/* Multi supporting documents */}
+          <div className="space-y-2">
+            {(files.supportingList || []).map((f, idx) => (
+              <div key={idx} className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-green-500/30 bg-green-500/5">
+                <span className="text-xl">{f.name?.endsWith('.pdf') ? '📄' : f.name?.endsWith('.docx') ? '📝' : '📊'}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-text truncate">{f.name}</p>
+                  <p className="text-xs text-green-400">✓ Uploaded</p>
+                </div>
+                <button onClick={() => onClear('supporting', idx)}
+                  className="text-dim hover:text-red-400 transition-colors text-xs px-2 py-1 rounded hover:bg-red-500/10">
+                  ✕
+                </button>
+              </div>
+            ))}
+            <div
+              className="rounded-xl border-2 border-dashed border-border hover:border-amber/40 bg-card transition-all cursor-pointer"
+              onClick={() => document.getElementById('sup-input').click()}
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => { e.preventDefault(); Array.from(e.dataTransfer.files).forEach(f => onFile('supporting', f)) }}
+            >
+              <input id="sup-input" type="file" accept=".pdf,.docx,.xlsx" multiple className="hidden"
+                onChange={e => Array.from(e.target.files).forEach(f => onFile('supporting', f))} />
+              <div className="p-4 flex items-center gap-4">
+                <div className="w-10 h-10 rounded-xl border border-border bg-surface flex items-center justify-center text-xl flex-shrink-0">📋</div>
+                <div>
+                  <p className="text-sm text-text font-medium">
+                    {(files.supportingList||[]).length > 0 ? 'Add another document' : 'Drop supporting documents here or'}&nbsp;
+                    <span className="text-amber underline">Click to browse</span>
+                  </p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.pdf</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.docx</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.xlsx</span>
+                    <span className="text-[10px] text-dim/60 ml-1">Multiple files supported</span>
+                  </div>
+                </div>
+              </div>
+              {errors.supporting && <p className="px-4 pb-3 text-xs text-red-400">⚠ {errors.supporting}</p>}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -154,7 +232,7 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext }) {
 
 // ─── Page: Configure ──────────────────────────────────────────────────────────
 
-function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, onRpChange, customReviewPoints, onCustomReviewPointsChange, generating, onBack, onGenerate, onNext }) {
+function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, onRpChange, customReviewPoints, onCustomReviewPointsChange, generating, onBack, onGenerate, onNext, reqPrefixes }) {
   return (
     <div className="max-w-5xl mx-auto px-6 py-8">
       <div className="mb-8">
@@ -169,16 +247,16 @@ function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, on
           <div className="flex items-center gap-2 mb-4">
             <div className="w-6 h-6 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">🎯</div>
             <h3 className="text-sm font-semibold text-text">Scope</h3>
-            <span className="text-xs text-dim ml-1">— which requirements to generate for</span>
+            <span className="text-xs text-dim ml-1">— Choose which requirements to generate test cases for</span>
           </div>
-          <ScopeSelector sessionId={sessionId} onChange={onScopeChange} />
+          <ScopeSelector sessionId={sessionId} onChange={onScopeChange} reqPrefixes={reqPrefixes} />
         </div>
 
         {/* Review points */}
         <div className="bg-card border border-border rounded-2xl p-5">
           <div className="flex items-center gap-2 mb-4">
             <div className="w-6 h-6 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">☑</div>
-            <h3 className="text-sm font-semibold text-text">Review points</h3>
+            <h3 className="text-sm font-semibold text-text">Generation Checklists</h3>
           </div>
           <ReviewPointsPanel
             reviewPoints={reviewPoints}
@@ -212,6 +290,8 @@ function PageGenerate({
   onLoadMcp, mcpAvailable, mcpResults, onExport,
 }) {
   const dupCount = summary?.duplicates_removed ?? 0
+  const [showPreview,  setShowPreview]  = useState(true)
+  const [showRegenerate, setShowRegenerate] = useState(false)
   return (
     <div className="flex flex-col h-full">
 
@@ -242,7 +322,53 @@ function PageGenerate({
           )}
         </div>
 
+        {/* Toolbar right buttons — only when test cases exist */}
+        {testCases.length > 0 && (
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button
+              onClick={() => setShowPreview(v => !v)}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border text-dim hover:border-amber/40 hover:text-amber transition-all"
+            >
+              {showPreview ? '🙈 Hide Preview' : '👁 Show Preview'}
+            </button>
+            <button
+              onClick={() => setShowRegenerate(v => !v)}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-amber/40 text-amber hover:bg-amber/10 transition-all"
+            >
+              ↺ Regenerate
+            </button>
+          </div>
+        )}
+
       </div>
+
+      {/* Regenerate panel */}
+      {showRegenerate && testCases.length > 0 && (
+        <div className="flex-shrink-0 mx-6 mt-3 px-5 py-4 rounded-xl bg-surface border border-border">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs font-semibold text-text">Generate again with a different engine</p>
+            <button onClick={() => setShowRegenerate(false)} className="text-dim hover:text-text text-xs">✕</button>
+          </div>
+          <div className="flex gap-3">
+            <button onClick={() => { onGenerate(); setShowRegenerate(false) }}
+              className="flex-1 flex items-center gap-2 px-4 py-2.5 rounded-xl border border-amber/30 bg-amber/5 hover:bg-amber/10 hover:border-amber transition-all text-left">
+              <span className="text-xl">⚙</span>
+              <div>
+                <p className="text-xs font-semibold text-text">Rule-Based NLP</p>
+                <p className="text-[10px] text-dim">Instant · offline · deterministic</p>
+              </div>
+            </button>
+            <button onClick={() => { onClaudeGenerate(); setShowRegenerate(false) }}
+              className="flex-1 flex items-center gap-2 px-4 py-2.5 rounded-xl border border-amber/30 bg-amber/5 hover:bg-amber/10 hover:border-amber transition-all text-left">
+              <span className="text-xl">✦</span>
+              <div>
+                <p className="text-xs font-semibold text-text">Claude AI</p>
+                <p className="text-[10px] text-dim">Richer · context-aware · via Claude Desktop</p>
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* MCP banner */}
       {mcpAvailable && mcpResults && (
@@ -276,9 +402,20 @@ function PageGenerate({
 
       {/* Table or empty */}
       {testCases.length > 0 ? (
-        <div className="flex-1 overflow-auto px-6 py-4">
-          <ResultsTable testCases={testCases} />
-        </div>
+        showPreview ? (
+          <div className="flex-1 overflow-auto px-6 py-4">
+            <ResultsTable testCases={testCases} />
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center">
+            <span className="text-4xl">🙈</span>
+            <p className="text-sm text-dim">Preview hidden</p>
+            <button onClick={() => setShowPreview(true)}
+              className="text-xs text-amber underline hover:no-underline">
+              Show preview
+            </button>
+          </div>
+        )
       ) : generating ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">
           <div className="w-14 h-14 rounded-2xl bg-amber/10 border border-amber/30 flex items-center justify-center">
@@ -319,9 +456,7 @@ function PageGenerate({
                 Instant offline generation. Uses deterministic NLP rules — MC/DC, condition coverage, decision table. No AI required.
               </p>
               <div className="mt-4 flex items-center gap-2">
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/30">Instant</span>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Offline</span>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Deterministic</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/30">Instant Without AI</span>
               </div>
             </button>
 
@@ -334,8 +469,7 @@ function PageGenerate({
                 Uses Claude Desktop via MCP. Generates richer, context-aware test cases with detailed preconditions and objectives.
               </p>
               <div className="mt-4 flex items-center gap-2">
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber/15 text-amber border border-amber/30">AI-powered</span>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-surface text-dim border border-border">Requires Desktop</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber/30">AI-powered</span>
               </div>
             </button>
           </div>
@@ -438,7 +572,7 @@ export default function App() {
   const [tab, setTab] = useState('upload')
 
   // Upload
-  const [files,    setFiles]    = useState({ srs: null, icd: null, supporting: null })
+  const [files,    setFiles]    = useState({ srs: null, icd: null, supporting: null, supportingList: [] })
   const [loading,  setLoading]  = useState({ srs: false, icd: false, supporting: false })
   const [errors,   setErrors]   = useState({ srs: '', icd: '', supporting: '' })
   const [sessions, setSessions] = useState({ srs: null, icd: null, supporting: null })
@@ -448,6 +582,7 @@ export default function App() {
   sessionsRef.current = sessions
 
   // Config
+  const [reqPrefixes,     setReqPrefixes]     = useState('')
   const [scopeConfig,     setScopeConfig]     = useState({ selectedReqIds: null, selectedModule: null })
   const [reviewPoints,    setReviewPoints]    = useState(DEFAULT_RP)
   const [customReviewPoints, setCustomReviewPoints] = useState([])
@@ -495,33 +630,56 @@ export default function App() {
       setErrors(e => ({ ...e, [type]: `Unsupported: ${ext}` })); return
     }
     setErrors(e => ({ ...e, [type]: '' }))
-    setFiles(fs => ({ ...fs, [type]: f }))
     setLoading(ld => ({ ...ld, [type]: true }))
     const form = new FormData(); form.append('file', f); form.append('doc_type', type)
     try {
       const res  = await fetch('/api/upload', { method: 'POST', body: form })
       const data = await res.json()
       if (!res.ok) throw new Error(data?.detail?.error || 'Upload failed')
-      const next = { ...sessionsRef.current, [type]: data }
-      setSessions(next)
-      if (next.srs) {
-        setUploadData({
-          ...next.srs,
-          icd_session_id:        next.icd?.session_id        || null,
-          supporting_session_id: next.supporting?.session_id || null,
-        })
-        if (type === 'srs') { setTestCases([]); setSummary(null); setError('') }
+      if (type === 'supporting') {
+        // Multi-file: append to list
+        setFiles(fs => ({
+          ...fs,
+          supportingList: [...(fs.supportingList || []), { name: f.name, session_id: data.session_id }]
+        }))
+        const next = { ...sessionsRef.current, supporting: data }
+        setSessions(next)
+        if (next.srs) {
+          setUploadData(prev => ({
+            ...next.srs,
+            icd_session_id:         next.icd?.session_id || null,
+            supporting_session_id:  data.session_id || null,
+            supporting_session_ids: [...((prev||{}).supporting_session_ids||[]), data.session_id].filter(Boolean),
+          }))
+        }
+      } else {
+        setFiles(fs => ({ ...fs, [type]: f }))
+        const next = { ...sessionsRef.current, [type]: data }
+        setSessions(next)
+        if (next.srs) {
+          setUploadData(prev => ({
+            ...next.srs,
+            icd_session_id:         next.icd?.session_id        || null,
+            supporting_session_id:  next.supporting?.session_id || null,
+            supporting_session_ids: (prev||{}).supporting_session_ids || [],
+          }))
+          if (type === 'srs') { setTestCases([]); setSummary(null); setError('') }
+        }
       }
     } catch (e) {
       setErrors(err => ({ ...err, [type]: e.message }))
-      setFiles(fs => ({ ...fs, [type]: null }))
+      if (type !== 'supporting') setFiles(fs => ({ ...fs, [type]: null }))
     } finally {
       setLoading(ld => ({ ...ld, [type]: false }))
     }
   }, [])
 
-  const handleClear = (type) => {
-    setFiles(fs => ({ ...fs, [type]: null }))
+  const handleClear = (type, idx) => {
+    if (type === 'supporting' && idx !== undefined) {
+      setFiles(fs => ({ ...fs, supportingList: fs.supportingList.filter((_, i) => i !== idx) }))
+      return
+    }
+    setFiles(fs => ({ ...fs, [type]: null, ...(type === 'supporting' ? { supportingList: [] } : {}) }))
     setSessions(s => ({ ...s, [type]: null }))
     setErrors(e => ({ ...e, [type]: '' }))
     if (type === 'srs') { setUploadData(null); setTestCases([]); setSummary(null) }
@@ -534,7 +692,6 @@ export default function App() {
     setProgress('Analysing document…')
     try {
       setProgress('Ingesting requirements…')
-      console.log('[GENERATE] _scope =', JSON.stringify(_scope))
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -544,10 +701,9 @@ export default function App() {
           custom_review_points:  customReviewPoints.map(p => p.label),
           icd_session_id:        uploadData.icd_session_id        || null,
           supporting_session_id: uploadData.supporting_session_id || null,
-          // Read _scope directly — module-level var, never stale
-          selected_req_ids:      Array.isArray(_scope.selectedReqIds) && _scope.selectedReqIds.length > 0
-                                   ? _scope.selectedReqIds : null,
-          selected_module:       _scope.selectedModule || null,
+          selected_req_ids:      scopeConfig.selectedReqIds || null,
+          selected_module:       scopeConfig.selectedModule  || null,
+          req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
         }),
       })
       const data = await res.json()
@@ -571,10 +727,9 @@ export default function App() {
           session_id:            uploadData.session_id,
           icd_session_id:        uploadData.icd_session_id        || null,
           supporting_session_id: uploadData.supporting_session_id || null,
-          // Read _scope directly — module-level var, never stale
-          selected_req_ids:      Array.isArray(_scope.selectedReqIds) && _scope.selectedReqIds.length > 0
-                                   ? _scope.selectedReqIds : null,
-          selected_module:       _scope.selectedModule || null,
+          selected_req_ids:      scopeConfig.selectedReqIds || null,
+          selected_module:       scopeConfig.selectedModule  || null,
+          req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
         }),
       })
       const qData = await qRes.json()
@@ -657,17 +812,17 @@ export default function App() {
 
       {/* ── Top bar ── */}
       <header className="flex-shrink-0 border-b border-border bg-surface z-10">
-        <div className="flex items-center h-12 px-5 justify-between">
+        <div className="relative flex items-center h-12 px-5">
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">⚙</div>
             <div>
-              <p className="text-xs font-semibold text-text leading-none">Test Case Generator</p>
-              <p className="text-[10px] text-dim font-mono">Rule-Based NLP</p>
+              <p className="text-xs font-semibold text-text leading-none"> Test Case Generator</p>
+              <p class="text-[10px] text-dim font-mono">AI Based Test Case Generation</p>
             </div>
           </div>
 
           {/* Tab navigation */}
-          <nav className="flex items-center">
+          <nav className="absolute left-1/2 -translate-x-1/2 flex items-center">
             {TABS.map((t, i) => {
               const allowed  = tabAllowed(t)
               const isActive = tab === t
@@ -705,11 +860,6 @@ export default function App() {
               )
             })}
           </nav>
-
-          <div className="flex items-center gap-2">
-            <span className={`w-1.5 h-1.5 rounded-full ${isMcp ? 'bg-green-400' : 'bg-amber'}`} />
-            <span className="text-[11px] text-dim font-mono">{isMcp ? 'AI Mode' : 'Offline'}</span>
-          </div>
         </div>
       </header>
 
@@ -721,6 +871,8 @@ export default function App() {
             files={files} loading={loading} errors={errors}
             onFile={handleFile} onClear={handleClear}
             onNext={() => setTab('configure')}
+            reqPrefixes={reqPrefixes}
+            onReqPrefixesChange={setReqPrefixes}
           />
         )}
 
@@ -728,6 +880,7 @@ export default function App() {
           <PageConfigure
             sessionId={uploadData?.session_id}
             scopeConfig={scopeConfig}    onScopeChange={setScopeConfig}
+            reqPrefixes={reqPrefixes}
             reviewPoints={reviewPoints}  onRpChange={(id, v) => setReviewPoints(rp => ({ ...rp, [id]: v }))}
             customReviewPoints={customReviewPoints} onCustomReviewPointsChange={setCustomReviewPoints}
             generating={generating}

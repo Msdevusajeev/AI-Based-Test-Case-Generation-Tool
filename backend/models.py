@@ -19,7 +19,7 @@ class TestCase(BaseModel):
     remarks: str
     module: str
     requirement_type: Literal["functional", "non-functional"]
-    scenario_type: Literal["normal", "boundary", "edge", "robustness"]
+    scenario_type: Literal["normal", "boundary", "edge", "robustness", "transition"]
     testing_type: Literal["verification", "validation", "integration"]
 
     @field_validator(
@@ -67,10 +67,12 @@ class GenerateRequest(BaseModel):
     session_id: str
     review_points: ReviewPoints
     icd_session_id: Optional[str] = None
-    supporting_session_id: Optional[str] = None
+    supporting_session_id:  Optional[str]       = None   # kept for backward compat
+    supporting_session_ids: Optional[List[str]]  = None   # multiple supporting docs
     # Scope filters — None means generate for all
     selected_req_ids: Optional[List[str]] = None
     selected_module:  Optional[str]       = None
+    req_prefixes:     Optional[List[str]] = None
 
 
 class GenerateSummary(BaseModel):

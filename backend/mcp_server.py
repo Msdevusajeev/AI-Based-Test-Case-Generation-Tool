@@ -156,6 +156,195 @@ async def call_tool(
 
 # ─── TOOL IMPLEMENTATIONS ─────────────────────────────────────────────────────
 
+
+def _extract_req_content(req_id: str, full_content: str) -> str:
+    """
+    Extract the text block belonging to req_id from full_content.
+    If full_content has multiple requirements, returns only the section
+    from req_id's line to the next requirement ID (or end of text).
+    Falls back to full_content if req_id not found.
+    """
+    import re
+
+    # Find where this req_id appears in the content
+    # Match patterns like "REQ_001:", "REQ_001 ", "REQ-001:", etc.
+    escaped = re.escape(req_id)
+    start_m = re.search(rf'(?:^|\n)\s*{escaped}\b', full_content, re.IGNORECASE)
+    if not start_m:
+        return full_content   # req_id not found, use full content
+
+    start = start_m.start()
+
+    # Find the next requirement ID after this one
+    # Look for patterns like REQ_XXX, MRJ_XXX, SRS_XXX etc. on a new line
+    next_req = re.search(
+        r'\n\s*(?:[A-Z][A-Z0-9]*[_-][A-Z0-9][A-Z0-9_-]{1,40})(?:\s*:|\s+[Tt]he|\s+shall)',
+        full_content[start + len(req_id):],
+        re.IGNORECASE
+    )
+    if next_req:
+        end = start + len(req_id) + next_req.start()
+        return full_content[start:end].strip()
+
+    return full_content[start:].strip()
+
+def _build_required_scenarios(req_id: str, content: str,
+                               sentence_contexts: list) -> list:
+    """
+    Pre-calculate every scenario that MUST be generated for this requirement.
+    Returns a list of scenario stubs with scenario_type, scenario_id, and
+    a hint for the input values — Claude fills in all remaining fields.
+    """
+    try:
+        from test_case_generator import _parse_conditional_requirement
+        parsed = _parse_conditional_requirement(content)
+        conditions   = parsed.get("conditions", [])
+        output_name  = parsed.get("output_name", "Output")
+        output_true  = parsed.get("output_true_val",  "True")
+        output_false = parsed.get("output_false_val", "False")
+        logic        = parsed.get("logic_type", "AND")
+    except Exception:
+        conditions, output_name = [], "Output"
+        output_true, output_false, logic = "True", "False", "AND"
+
+    scenarios = []
+    sc = 1
+
+    def sid():
+        nonlocal sc
+        s = f"SC_{sc:03d}"; sc += 1; return s
+
+    # ── 1. NORMAL — all conditions at required value ──────────────────────────
+    normal_inputs = [f"{c['name']}: {c['required_val']}" for c in conditions]
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "normal",
+        "hint_inputs":   normal_inputs or ["All inputs at nominal/active values"],
+        "hint_outcome":  f"{output_name} = {output_true}",
+        "hint_objective": f"Verify {output_name} is {output_true} when all conditions are simultaneously met",
+    })
+
+    # ── 2. BOUNDARY — flip one condition at a time (MC/DC) ───────────────────
+    for cond in conditions:
+        flip_inputs = []
+        for c in conditions:
+            val = c["flip_val"] if c["name"] == cond["name"] else c["required_val"]
+            flip_inputs.append(f"{c['name']}: {val}")
+        expected = output_false if logic == "AND" else (
+            output_true if any(
+                c["required_val"] != c["flip_val"] and c["name"] != cond["name"]
+                for c in conditions
+            ) else output_false
+        )
+        scenarios.append({
+            "scenario_id":   sid(),
+            "scenario_type": "boundary",
+            "hint_inputs":   flip_inputs,
+            "hint_outcome":  f"{output_name} = {expected}",
+            "hint_objective": f"Verify {output_name} changes to {expected} when {cond['name']} transitions to {cond['flip_val']} (MC/DC independence)",
+        })
+
+    # ── 3. BOUNDARY — exact threshold / min and max ───────────────────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "boundary",
+        "hint_inputs":   [f"{c['name']}: <exact threshold value>" for c in conditions[:2]] or ["Input at exact activation threshold"],
+        "hint_outcome":  f"{output_name} = {output_true} (exactly at threshold)",
+        "hint_objective": f"Verify {output_name} at exact boundary/threshold value of each numeric input",
+    })
+
+    # ── 4. EDGE — all conditions at flip/inactive value ──────────────────────
+    all_flip = [f"{c['name']}: {c['flip_val']}" for c in conditions]
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "edge",
+        "hint_inputs":   all_flip or ["All inputs at inactive/false/zero values"],
+        "hint_outcome":  f"{output_name} = {output_false}",
+        "hint_objective": f"Verify {output_name} is {output_false} when ALL conditions are simultaneously inactive",
+    })
+
+    # ── 5. EDGE — conflicting / only one condition active ────────────────────
+    if conditions:
+        one_active = [
+            f"{c['name']}: {c['required_val'] if i == 0 else c['flip_val']}"
+            for i, c in enumerate(conditions)
+        ]
+        scenarios.append({
+            "scenario_id":   sid(),
+            "scenario_type": "edge",
+            "hint_inputs":   one_active,
+            "hint_outcome":  f"{output_name} = {output_false if logic == 'AND' else output_true}",
+            "hint_objective": f"Verify system handles partially satisfied conditions correctly",
+        })
+
+    # ── 6. ROBUSTNESS — invalid / out-of-range input ─────────────────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "robustness",
+        "hint_inputs":   [f"{conditions[0]['name']}: <invalid/out-of-range value>"] if conditions else ["Input: invalid value"],
+        "hint_outcome":  f"{output_name} = {output_false} (system handles invalid input gracefully)",
+        "hint_objective": "Verify system remains stable and output is safe when an input receives an invalid/out-of-range value",
+    })
+
+    # ── 7. ROBUSTNESS — signal unavailable / communication loss ──────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "robustness",
+        "hint_inputs":   [f"{c['name']}: Unavailable" for c in (conditions[:2] if conditions else [{"name": "Input signal"}])],
+        "hint_outcome":  f"{output_name} = {output_false} (safe state on signal loss)",
+        "hint_objective": "Verify system enters safe state when input signals become unavailable or communication is lost",
+    })
+
+    # ── 8. ROBUSTNESS — recovery after fault ─────────────────────────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "robustness",
+        "hint_inputs":   normal_inputs or ["Inputs restored to valid nominal values"],
+        "hint_outcome":  f"{output_name} = {output_true} (system recovers correctly)",
+        "hint_objective": f"Verify {output_name} recovers to {output_true} after invalid inputs return to valid range",
+    })
+
+    # ── 9. TRANSITION — inactive → active ────────────────────────────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "transition",
+        "hint_inputs":   (
+            [f"{conditions[0]['name']}: {conditions[0]['flip_val']} → {conditions[0]['required_val']}"]
+            + [f"{c['name']}: {c['required_val']}" for c in conditions[1:]]
+        ) if conditions else ["State: Inactive → Active"],
+        "hint_outcome":  f"{output_name} transitions from {output_false} to {output_true}",
+        "hint_objective": f"Verify {output_name} activates correctly as conditions transition from inactive to active state",
+    })
+
+    # ── 10. TRANSITION — active → inactive ───────────────────────────────────
+    scenarios.append({
+        "scenario_id":   sid(),
+        "scenario_type": "transition",
+        "hint_inputs":   (
+            [f"{conditions[0]['name']}: {conditions[0]['required_val']} → {conditions[0]['flip_val']}"]
+            + [f"{c['name']}: {c['required_val']}" for c in conditions[1:]]
+        ) if conditions else ["State: Active → Inactive"],
+        "hint_outcome":  f"{output_name} transitions from {output_true} to {output_false}",
+        "hint_objective": f"Verify {output_name} deactivates correctly when a condition transitions from active to inactive",
+    })
+
+    # ── 11. TRANSITION — partial activation (if multi-condition AND) ─────────
+    if len(conditions) >= 2 and logic == "AND":
+        partial = [
+            f"{c['name']}: {c['required_val'] if i == 0 else c['flip_val']}"
+            for i, c in enumerate(conditions)
+        ]
+        scenarios.append({
+            "scenario_id":   sid(),
+            "scenario_type": "transition",
+            "hint_inputs":   partial,
+            "hint_outcome":  f"{output_name} = {output_false} (partial activation not sufficient)",
+            "hint_objective": "Verify output remains inactive when only a subset of AND conditions are met during activation sequence",
+        })
+
+    return scenarios
+
+
 def _extract_nlp_context_for_queue() -> str:
     """
     Fetches the AI queue, runs the NLP module to extract structured context
@@ -211,14 +400,32 @@ def _extract_nlp_context_for_queue() -> str:
             module   = chunk_data.get("module", "General")
             req_type = chunk_data.get("requirement_type", "functional")
 
-            prefixed = f"{req_id} {content}"
+            # Extract ONLY this requirement's text from the chunk content.
+            # This prevents signals/values from sibling requirements polluting
+            # the condition parsing for this specific requirement.
+            req_content = _extract_req_content(req_id, content)
+            prefixed = f"{req_id}: {req_content}"
             try:
                 chunk_list = ingest_document(prefixed)
                 if not chunk_list:
-                    continue
+                    # Fallback: wrap as minimal chunk
+                    from document_ingestion import DocumentChunk
+                    chunk_list = [DocumentChunk(
+                        requirement_ids=[req_id], content=content,
+                        module=module, requirement_type=req_type,
+                        is_sub_req=False, parent_id=None
+                    )]
+
+                # Keep ONLY the first chunk — ingest_document may produce
+                # extra chunks when the body text contains cross-referenced
+                # IDs (e.g. "see also MRJ_MCU_SRS_005"). Those extras are
+                # not separate requirements and inflate the count from 11→18.
+                chunk_list = chunk_list[:1]
 
                 for chunk in chunk_list:
-                    chunk_req_id = chunk.requirement_ids[0] if chunk.requirement_ids else req_id
+                    # Always use the req_id from the outer chunk_data entry
+                    # (ingest may split or rename; we preserve the original)
+                    chunk_req_id = req_id
                     sentences    = extract_requirement_sentences(chunk.content)
                     notes_ctx    = getattr(chunk, "notes_context", "")
 
@@ -251,14 +458,19 @@ def _extract_nlp_context_for_queue() -> str:
                         })
 
                     if sentence_contexts:
+                        required_scenarios = _build_required_scenarios(
+                            chunk_req_id, chunk.content, sentence_contexts
+                        )
                         requirements_context.append({
-                            "requirement_id":   chunk_req_id,
-                            "module":           chunk.module,
-                            "requirement_type": chunk.requirement_type,
-                            "is_sub_req":       chunk.is_sub_req,
-                            "parent_id":        chunk.parent_id,
-                            "notes_context":    notes_ctx,
-                            "sentences":        sentence_contexts,
+                            "requirement_id":       chunk_req_id,
+                            "module":               chunk.module,
+                            "requirement_type":     chunk.requirement_type,
+                            "is_sub_req":           chunk.is_sub_req,
+                            "parent_id":            chunk.parent_id,
+                            "notes_context":        notes_ctx,
+                            "sentences":            sentence_contexts,
+                            "required_scenarios":   required_scenarios,
+                            "required_scenario_count": len(required_scenarios),
                         })
 
             except Exception:
@@ -303,11 +515,17 @@ def _extract_nlp_context_for_queue() -> str:
                 ],
                 "generation_rules": [
                     "Use the sentence, subject, and action from NLP context to author each field",
-                    "Generate four test cases per requirement sentence: normal, boundary, edge, robustness",
+                    "required_scenarios gives you the EXACT list — generate one TC per entry; do NOT skip any",
+                    "required_scenario_count tells you the total; your output MUST match that count",
+                    "Copy the scenario_id from required_scenarios entry exactly (SC_001, SC_002...)",
+                    "Use hint_inputs as the starting point for the inputs field",
+                    "Use hint_outcome as the starting point for expected_outcome",
+                    "Use hint_objective as the starting point for objective",
+                    "Complete ALL other required fields (preconditions, test_steps, remarks, etc.)",
                     "No modal verbs (shall/must/can/will) anywhere in objective, steps, or expected_outcome",
                     "test_steps must be an array of numbered strings: ['1. Do X', '2. Do Y']",
                     "preconditions must be an array of strings",
-                    "inputs must be an array of strings in 'SignalName: Value' format using the actual signal names from the requirement",
+                    "inputs MUST include EVERY input signal for EVERY scenario — even signals that are not being varied must be listed with their nominal value. A scenario with 3 input signals must always have 3 entries in inputs. NEVER leave any signal out of the inputs array",
                     "expected_outcome MUST begin with 'RealSignalName = True/False. ' — extract the output signal name from the requirement sentence itself; do NOT use 'output', 'Output signal', or any generic placeholder",
                     "If notes_context is present, incorporate enum definitions or cross-references into remarks",
                     "For sub-requirements (is_sub_req=true), reference parent_id in dependent_test_cases for the normal scenario",

@@ -20,6 +20,7 @@ _NON_REQ_SECTIONS = re.compile(
         definitions? | abbreviations? | acronyms? | glossary | terms? |
         table\s+of\s+contents? | contents? | index |
         revision\s+history | change\s+(log|history|record) | document\s+history |
+        deleted | obsolete | tbd | tbc | reserved | placeholder |
         document\s+control | document\s+organization | document\s+structure |
         applicability | general\s+information | general |
         list\s+of\s+(figures?|tables?) |
@@ -151,27 +152,62 @@ def parse_docx(file_bytes: bytes) -> str:
     parts = []
     try:
         doc = Document(io.BytesIO(file_bytes))
-        for para in doc.paragraphs:
+        # Words that appear as heading text but are NOT real module names.
+        _SKIP_HEADING_WORDS = {
+            "deleted", "obsolete", "reserved", "tbd", "tbc", "na",
+            "none", "placeholder", "empty", "blank", "unknown",
+        }
+
+        # Track heading hierarchy so skipped headings can fall back to parent
+        _heading_stack = {}  # level (1-6) -> last seen heading text
+        import re as _re
+
+        def _emit_para(para):
             text = para.text.strip()
             if not text:
-                continue
+                return
             style_name = para.style.name if para.style else ""
-            if style_name.startswith("Heading"):
+            is_heading = style_name.startswith("Heading") or _paragraph_is_bold_heading(para)
+            if is_heading:
                 parts.append(f"\n## {text}")
-                parts.append(f"[MODULE: {text}]")
-            elif _paragraph_is_bold_heading(para):
-                # Bold non-heading paragraph = module section boundary
-                parts.append(f"\n## {text}")
-                parts.append(f"[MODULE: {text}]")
+                _lm = _re.match(r"Heading (\d+)", style_name)
+                _level = int(_lm.group(1)) if _lm else 99
+                if text.strip().lower() not in _SKIP_HEADING_WORDS:
+                    parts.append(f"[MODULE: {text}]")
+                    _heading_stack[_level] = text
+                    for _l in list(_heading_stack):
+                        if _l > _level: del _heading_stack[_l]
+                else:
+                    # Skipped heading — re-emit nearest valid parent as MODULE
+                    _parent = next(
+                        (_heading_stack[_l] for _l in sorted(_heading_stack) if _l < _level),
+                        None
+                    )
+                    if _parent:
+                        parts.append(f"[MODULE: {_parent}]")
             else:
                 parts.append(text)
-        for table in doc.tables:
+
+        def _emit_table(table):
             for row in table.rows:
                 row_text = " | ".join(
                     cell.text.strip() for cell in row.cells if cell.text.strip()
                 )
                 if row_text:
                     parts.append(row_text)
+
+        # Walk document body IN ORDER (paragraphs and tables interleaved).
+        # This is critical: table requirements must inherit the heading that
+        # immediately precedes their table in the document, not the last
+        # heading anywhere in the file.
+        from docx.text.paragraph import Paragraph as _Para
+        from docx.table import Table as _Table
+        for _child in doc.element.body:
+            _tag = _child.tag.split("}")[-1] if "}" in _child.tag else _child.tag
+            if _tag == "p":
+                _emit_para(_Para(_child, doc))
+            elif _tag == "tbl":
+                _emit_table(_Table(_child, doc))
     except Exception as e:
         raise RuntimeError(f"DOCX parsing error: {e}")
     return "\n".join(parts)

@@ -505,6 +505,57 @@ def _sc_label(sc_no: int) -> str:
 #   • Test Objective (from col D/E)
 #   • Test Steps that are related to the identified input parameter names (from H, I... cols)
 
+def _col_e_test_details(tc: TestCase) -> str:
+    """
+    Column E — Test Details Description.
+    A narrative explanation of what this test does and why — scenario-type driven.
+    Does NOT repeat inputs, expected output, preconditions, or objective.
+    """
+    _DETAIL_MAP = {
+        "normal": (
+            "Verifies the primary activation path. All input conditions are set to their "
+            "nominal required values simultaneously to confirm the system output activates "
+            "as specified. This scenario also serves as the baseline reference for all "
+            "MC/DC independence pair tests."
+        ),
+        "boundary": (
+            "Verifies MC/DC independence by varying exactly one input condition at a time "
+            "while holding all other conditions at their required values. Confirms the "
+            "output state change is solely and independently controlled by the varied "
+            "condition, satisfying the MC/DC coverage criterion per DO-178C."
+        ),
+        "edge": (
+            "Verifies system behaviour when all input conditions are simultaneously "
+            "inactive, conflicting, or at non-activating values. Confirms the output "
+            "remains in its safe inactive state and the system correctly handles this "
+            "configuration without any unintended activation."
+        ),
+        "robustness": (
+            "Verifies system stability and fault tolerance when inputs receive invalid, "
+            "out-of-range, or unavailable values. Confirms the system does not crash, "
+            "produce undefined outputs, or enter an unsafe state. Also tests recovery "
+            "behaviour when inputs return to valid range."
+        ),
+        "transition": (
+            "Verifies correct state transition behaviour as the system moves between "
+            "active and inactive states. Confirms output activation and deactivation "
+            "sequences are correct, partial activation conditions are handled properly, "
+            "and state changes occur at the expected trigger points."
+        ),
+    }
+
+    sc_type = (tc.scenario_type or "").lower()
+    base    = _DETAIL_MAP.get(sc_type, "Verifies functional system behaviour as specified in the requirement.")
+
+    # Append methodology context if available
+    extra = []
+    if tc.design_methodology:
+        extra.append(f"Design methodology: {tc.design_methodology}.")
+    if tc.module:
+        extra.append(f"Module under test: {tc.module}.")
+
+    return (base + "\n" + "  ".join(extra)).strip() if extra else base
+
 def _col_f_precondition(tc: TestCase, input_signals: List[str]) -> str:
     """
     Column F — Test Precondition.
@@ -793,7 +844,8 @@ def _extract_output_value_only(expected_outcome: str) -> str:
 # ─── STANDALONE ROW WRITER ────────────────────────────────────────────────────
 
 def _write_tc_row(ws, row_idx: int, tc: TestCase,
-                  col_map: dict, in_sigs: List[str], out_sigs: List[str]) -> None:
+                  col_map: dict, in_sigs: List[str], out_sigs: List[str],
+                  signal_defaults: dict = None) -> None:
     """
     Writes one TC row into worksheet ws at row_idx.
 
@@ -823,8 +875,8 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
     _p(col_map["TC_ID"],                   tc_id)
     _p(col_map["Scenario No"],             sc_lbl)
     _p(col_map["Test Objective"],          tc.objective)
-    _p(col_map["Test Details Description"],_list_to_str(tc.preconditions))
-    _p(col_map["Test Precondition"],       _col_f_precondition(tc, in_sigs))
+    _p(col_map["Test Details Description"], _col_e_test_details(tc))
+    _p(col_map["Test Precondition"],        _col_f_precondition(tc, in_sigs))
 
     # ── Input sub-columns ──────────────────────────────────────────────────────
     # Each named signal gets its own dedicated column.
@@ -835,7 +887,10 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
         sig_values = [_get_signal_value(tc, sig, "input") for sig in in_sigs]
         if any(sig_values):
             # Named signals matched — write each value into its own sub-column.
-            for idx_i, val in enumerate(sig_values):
+            # If a signal is missing, inherit from the normal-scenario default.
+            for idx_i, (sig, val) in enumerate(zip(in_sigs, sig_values)):
+                if not val and signal_defaults:
+                    val = signal_defaults.get(sig.lower(), "")
                 _p(col_map["Inputs_start"] + idx_i, val, center=True)
         else:
             # No named signal matched for this TC (generic template row).
@@ -884,6 +939,23 @@ def _safe_sheet_name(req_id: str, used: set) -> str:
 
 
 # ─── EXCEL EXPORT ─────────────────────────────────────────────────────────────
+
+def _build_signal_defaults(tcs: list) -> dict:
+    """
+    From the normal scenario (SC_001) for a requirement, build a dict of
+    {signal_name_lower: value} used as fallback when other scenarios omit
+    a signal that is not being varied.
+    """
+    if not tcs:
+        return {}
+    normal = next((t for t in tcs if t.scenario_type == "normal"), tcs[0])
+    defaults = {}
+    for entry in normal.inputs:
+        name, value = _parse_signal_value(entry)
+        if name:
+            defaults[name.lower()] = value
+    return defaults
+
 
 def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
     """
@@ -968,7 +1040,8 @@ def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
         r_cmap      = _write_headers(ws_r, r_in, r_out)
 
         for row_idx, tc in enumerate(req_tcs, start=3):
-            _write_tc_row(ws_r, row_idx, tc, r_cmap, r_in, r_out)
+            _write_tc_row(ws_r, row_idx, tc, r_cmap, r_in, r_out,
+                          signal_defaults=_build_signal_defaults(req_tcs))
 
     # Summary sheet always last
     wb.move_sheet("Summary", offset=len(wb.worksheets) - 1)
@@ -1025,7 +1098,7 @@ def generate_docx(test_cases: List[TestCase], removed_count: int) -> bytes:
                 ("TC_ID",                   tc_id),
                 ("Scenario No",             sc_lbl),
                 ("Test Objective",          tc.objective),
-                ("Test Details Description",_list_to_str(tc.preconditions)),
+                ("Test Details Description", _col_e_test_details(tc)),
                 ("Test Precondition",       _col_f_precondition(tc, input_signals)),
                 ("Inputs",                  _list_to_str(tc.inputs)),
                 ("Test Steps",              _list_to_str(tc.test_steps)),

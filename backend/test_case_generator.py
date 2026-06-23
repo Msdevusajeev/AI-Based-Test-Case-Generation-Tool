@@ -668,7 +668,19 @@ def _get_flip_value(name: str, value: str, full_content: str) -> str:
     For boolean/enum: uses known opposites or Notes-declared enum values.
     For numeric: uses ICD range data (e.g. 'Range: -100 to 100') to produce
                  a valid out-of-range value that violates the condition.
+    Handles comparison operators: < > <= >= → inverts the operator.
     """
+    # Comparison operator flip: invert the operator direction
+    _cmp = {'< ': '>= ', '> ': '<= ', '<= ': '> ', '>= ': '< '}
+    for op, flipped in _cmp.items():
+        if value.startswith(op):
+            return flipped + value[len(op):]
+    # Also handle without trailing space
+    _cmp2 = {'<': '>= ', '>': '<= '}
+    for op, flipped in _cmp2.items():
+        if value.startswith(op) and not value.startswith('<=') and not value.startswith('=>'):
+            return flipped + value[len(op):].strip()
+
     lv = value.lower().strip()
 
     # Boolean flip
@@ -726,70 +738,225 @@ def _parse_conditional_requirement(content: str) -> dict:
       - output_true_val / output_false_val
       - conditions:     list of { name, required_val, flip_val }
 
-    Supports:
-      - Boolean conditions  (is True / is False)
-      - Enum conditions     (is Active / is Inactive)
-      - Numeric conditions  (is 5 / is 10) with ICD range lookup for flip value
+    Handles all common SRS formats:
+      - Bullet list:    "- Radio Altitude is True"
+      - Inline and/or:  "when X is True and Y is False"
+      - Equality:       "when Signal = Value"  or  "Signal = True"
+      - Comparison:     "when Value < 500"  or  "Signal >= threshold"
+      - Colon format:   "Signal: Value"
     """
     result = {
-        "logic_type":       "AND",   # default
+        "logic_type":       "AND",
         "output_name":      "",
         "output_true_val":  "True",
         "output_false_val": "False",
         "conditions":       [],
     }
 
-    # Detect AND vs OR logic
+    # ── Detect AND vs OR logic ────────────────────────────────────────────────
     if _OR_PATTERN.search(content):
         result["logic_type"] = "OR"
 
-    # Extract output variable and its true value
-    set_m = re.search(
-        r"shall\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+[\"'\u2018\u2019\u201c\u201d]?"
-        r"(True|Enabled|Active|1)[\"'\u2018\u2019\u201c\u201d]?",
-        content, re.IGNORECASE
-    )
-    if set_m:
-        result["output_name"]     = set_m.group(1).strip().rstrip("'")
-        result["output_true_val"] = set_m.group(2)
+    # ── Extract output signal name ────────────────────────────────────────────
+    # Format: "shall set <name> to <True|Enabled|Active|1>"
+    _QUOTE_CHARS = r'[\u2018\u2019\u201c\u201d\"\' ]'
+    for pat in [
+        r'shall\s+set\s+(?:the\s+)?([\w\s]{3,60}?)\s+to\s+' + _QUOTE_CHARS + r'?(True|Enabled|Active|Green|Valid|1)' + _QUOTE_CHARS + r'?',
+        r'(?:activate|enable|assert)\s+(?:the\s+)?([\w\s]{3,60})',
+        r'([\w_]{3,60})\s*=\s*(True|Enabled|Enable|Active|Green|Valid|1)\b',
+    ]:
+        m = re.search(pat, content, re.IGNORECASE)
+        if m:
+            result["output_name"]     = m.group(1).strip().rstrip("'")
+            result["output_true_val"] = m.group(2) if m.lastindex >= 2 else "True"
+            break
 
     otherwise_m = re.search(
-        r"otherwise\s+set\s+to\s+[\"'\u2018\u2019\u201c\u201d]?(\w+)[\"'\u2018\u2019\u201c\u201d]?",
+        r'otherwise\s+(?:set\s+to\s+)?[\u2018\u2019\u201c\u201d"\'](\w+)[\u2018\u2019\u201c\u201d"\']',
         content, re.IGNORECASE
     )
+    if not otherwise_m:
+        otherwise_m = re.search(r'otherwise\s+(?:set\s+to\s+)?(\w+)', content, re.IGNORECASE)
     if otherwise_m:
         result["output_false_val"] = otherwise_m.group(1)
 
-    # Split at the "conditions are met" boundary to isolate the conditions block
+    # ── Isolate the conditions block ──────────────────────────────────────────
     split_pat = _OR_PATTERN if result["logic_type"] == "OR" else _COND_COVERAGE_PATTERN
     parts = split_pat.split(content)
     cond_text = parts[1] if len(parts) > 1 else content
 
-    # Parse each bullet/line as a condition "X is Y"
-    for line in cond_text.splitlines():
-        line = line.strip().lstrip('*-•→►▶\u2022').strip()
-        if not line or re.match(r'notes?\s*:', line, re.IGNORECASE):
+    # Also handle inline "when X ... and Y ... and Z" (no bullet list)
+    when_m = re.search(r'\bwhen\b(.+)$', cond_text, re.IGNORECASE | re.DOTALL)
+    if when_m:
+        inline = when_m.group(1).strip()
+        # Split inline conditions on " and " or " or "
+        # but keep each clause as a candidate condition line
+        inline_parts = re.split(r'\b(?:and|or)\b', inline, flags=re.IGNORECASE)
+        if len(inline_parts) > 1:
+            cond_text = "\n".join(inline_parts)
+
+    # ── Parse Notes section for enum declarations ────────────────────────────
+    # Handles single and compound Notes formats:
+    #   "Signal is an enum with N values A, B and C"
+    #   "Signal1 and Signal2 are an enum with N values A and B"
+    enum_values: dict = {}
+    for note_line in cond_text.splitlines():
+        # Format: "SignalA and SignalB are an enum with N values X and Y"
+        multi_m = re.search(
+            r'(.+?)\s+and\s+(.+?)\s+are\s+an\s+enum\s+with\s+\d+\s+values?\s+(.+)$',
+            note_line, re.IGNORECASE
+        )
+        if multi_m:
+            raw_vals = re.split(r',\s*|\s+and\s+', multi_m.group(3).strip().rstrip('.'))
+            raw_vals = [v.strip().strip('\u2018\u2019\u201c\u201d"\' ') for v in raw_vals if v.strip()]
+            for sig_raw in [multi_m.group(1), multi_m.group(2)]:
+                sig_name = re.sub(r'^[Tt]he\s+', '', sig_raw.strip()).lower()
+                if raw_vals:
+                    enum_values[sig_name] = raw_vals
             continue
-        if len(line.split()) < 3:
+        # Format: "Signal is an enum with N values A, B and C"
+        em = re.search(
+            r'(.+?)\s+is\s+an\s+enum\s+with\s+\d+\s+values?\s+(.+)$',
+            note_line, re.IGNORECASE
+        )
+        if em:
+            sig_name = re.sub(r'^[Tt]he\s+', '', em.group(1).strip()).lower()
+            raw_vals = re.split(r',\s*|\s+and\s+', em.group(2).strip().rstrip('.'))
+            raw_vals = [v.strip().strip('\u2018\u2019\u201c\u201d"\' ') for v in raw_vals if v.strip()]
+            if raw_vals:
+                enum_values[sig_name] = raw_vals
+
+
+    seen_names: set = set()
+
+    # Pre-expand "Either X is Y or Z is W" into two separate lines
+    expanded_lines = []
+    for raw_line in cond_text.splitlines():
+        stripped = raw_line.strip().lstrip('*-•→►▶\u2022·').strip()
+        # Detect "Either X is Y or Z is W" pattern and split into two lines
+        either_m = re.match(
+            r'(?:either\s+)?(.+?\s+is\s+[\u2018\u2019\u201c\u201d"\' ]?\w+[\u2018\u2019\u201c\u201d"\' ]?)'
+            r'\s+or\s+(.+?\s+is\s+[\u2018\u2019\u201c\u201d"\' ]?\w+[\u2018\u2019\u201c\u201d"\' ]?)\s*[,.]?$',
+            stripped, re.IGNORECASE
+        )
+        if either_m:
+            expanded_lines.append(either_m.group(1).strip())
+            expanded_lines.append(either_m.group(2).strip())
+        else:
+            expanded_lines.append(raw_line)
+
+    for raw_line in expanded_lines:
+        line = raw_line.strip().lstrip('*-•→►▶\u2022·').strip()
+        # Skip empty, notes headers, very short lines, output lines
+        if not line or len(line) < 4:
+            continue
+        if re.match(r'notes?\s*:', line, re.IGNORECASE):
+            continue
+        if re.search(r'shall\s+set', line, re.IGNORECASE):
+            continue
+        if re.search(r'otherwise', line, re.IGNORECASE):
+            continue
+        # Skip Notes enum declarations (already parsed above)
+        if re.search(r'is\s+an\s+enum\s+with', line, re.IGNORECASE):
+            continue
+        # Skip "and are an enum" lines
+        if re.search(r'are\s+an\s+enum\s+with', line, re.IGNORECASE):
             continue
 
-        # Match: "<name> is <value>" — value can be word or number
+        # Strip surrounding quotes from the whole line first
+        line_clean = line.strip('"\'‘’“”')
+
+        name = val = None
+
+        # Pattern 1: "Signal is 'Value'" or "Signal is Value" — quoted or bare
+        # Accepts ANY word as value (not just known booleans) since we're in
+        # the conditions block. Also handles "less than N", "greater than N".
         m = re.match(
-            r'(.+?)\s+is\s+(True|False|Active|Inactive|Enabled|Disabled|'
-            r'Set|Reset|High|Low|On|Off|Open|Closed|-?\d+(?:\.\d+)?|\w+)\s*\.?\s*$',
+            r'(.+?)\s+is\s+[\u2018\u2019\u201c\u201d\"\']*'
+            r'(less\s+than|greater\s+than|not\s+available|[\w][\w\s]{0,30}?)' 
+            r'[\u2018\u2019\u201c\u201d\"\' ]*[,.]?\s*$',
             line, re.IGNORECASE
         )
         if m:
             raw_name = m.group(1).strip()
-            name     = re.sub(r'^[Tt]he\s+', '', raw_name).strip()
-            req_val  = m.group(2)
-            flip_val = _get_flip_value(name, req_val, content)
-            result["conditions"].append({
-                "name":         name,
-                "required_val": req_val,
-                "flip_val":     flip_val,
-            })
+            raw_val  = m.group(2).strip().strip('"\'‘’“”')
+            if raw_val.lower().startswith('less than'):
+                nums = re.findall(r'-?[\d.]+', raw_val)
+                raw_val = f"< {nums[0]}" if nums else "< threshold"
+            elif raw_val.lower().startswith('greater than'):
+                nums = re.findall(r'-?[\d.]+', raw_val)
+                raw_val = f"> {nums[0]}" if nums else "> threshold"
+            # Filter out values that look like sentence fragments (> 4 words)
+            if len(raw_val.split()) <= 4:
+                name, val = raw_name, raw_val
 
+        # Pattern 2: "Signal = Value" (with optional quotes)
+        if not name:
+            m = re.match(
+                r'([\w][\w\s\.]{1,60})\s*=\s*[\u2018\u2019\u201c\u201d\"\']*([\w][\w\s]{0,30}?)[\u2018\u2019\u201c\u201d\"\' ]*[,.]?\s*$',
+                line
+            )
+            if m and re.match(r'[A-Za-z]', m.group(1)):
+                name = m.group(1).strip()
+                val  = m.group(2).strip().strip('"\'‘’“”')
+
+        # Pattern 3: "Signal < N" or "Signal >= N" comparisons
+        if not name:
+            m = re.match(
+                r'([\w][\w\s\.]{1,60})\s*(<=|>=|<|>|==|!=)\s*([\u2018\u2019\u201c\u201d\"\']*[\w][\w\s]{0,20}[\u2018\u2019\u201c\u201d\"\']*)[,.]?\s*$',
+                line
+            )
+            if m and re.match(r'[A-Za-z]', m.group(1)):
+                name = m.group(1).strip()
+                val  = f"{m.group(2)} {m.group(3).strip().strip(chr(39)+chr(34))}"
+
+        # Pattern 4: "Signal: Value"
+        if not name:
+            m = re.match(
+                r'([\w][\w\s\.]{1,60}):\s*[\u2018\u2019\u201c\u201d\"\']*([\w][\w\s]{0,20})[\u2018\u2019\u201c\u201d\"\']*[,.]?\s*$',
+                line
+            )
+            if m and re.match(r'[A-Za-z]', m.group(1)):
+                name = m.group(1).strip()
+                val  = m.group(2).strip()
+
+        if not name or not val:
+            continue
+
+        # Clean name: strip "The " prefix, collapse whitespace
+        name = re.sub(r'^[Tt]he\s+', '', name).strip()
+        name = re.sub(r'\s+', ' ', name)
+
+        # Reject if name looks like a sentence (too many words)
+        if len(name.split()) > 7:
+            continue
+        # Skip duplicate signals
+        if name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+
+        # Determine flip value — use Notes enum if available
+        name_key = name.lower()
+        if name_key in enum_values:
+            enum_vals = enum_values[name_key]
+            val_lower = val.lower()
+            # Pick the first enum value that is NOT the current value
+            flip_val = next(
+                (v for v in enum_vals if v.lower() != val_lower),
+                _get_flip_value(name, val, cond_text)
+            )
+        else:
+            flip_val = _get_flip_value(name, val, cond_text)
+
+        result["conditions"].append({
+            "name":         name,
+            "required_val": val,
+            "flip_val":     flip_val,
+            "enum_values":  enum_values.get(name_key, []),  # all valid values for this signal
+        })
+
+    # Sanity cap
+    result["conditions"] = result["conditions"][:20]
     return result
 
 

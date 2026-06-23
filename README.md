@@ -78,7 +78,7 @@ npm run dev
 ### 3 — Open browser
 
 ```
-http://localhost:5173
+http://localhost:8000
 ```
 
 ---

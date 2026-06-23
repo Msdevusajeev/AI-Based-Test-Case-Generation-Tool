@@ -157,7 +157,7 @@ export default function ReviewPointsPanel({
               group-hover:bg-amber group-hover:text-bg">
               +
             </span>
-            <span className="text-xs font-medium">Add custom review point</span>
+            <span className="text-xs font-medium">Add customised prompts</span>
           </button>
         )
       )}

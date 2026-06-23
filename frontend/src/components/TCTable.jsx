@@ -75,19 +75,12 @@ const DETAIL_MAP = {
 }
 
 function colE(tc) {
-  var DMAP = {
-    normal: 'Verifies the primary activation path. All inputs set to nominal values confirm output activates as specified. Baseline for MC/DC independence tests.',
-    boundary: 'Verifies MC/DC independence: one condition varies at a time, others fixed at required values. Confirms independent output control per DO-178C.',
-    edge: 'Verifies all-inactive/conflicting inputs: output must stay safely inactive without unintended activation.',
-    robustness: 'Verifies fault tolerance: invalid/missing inputs must not cause crash or unsafe output. Recovery also tested.',
-    transition: 'Verifies state transition sequences: activation, deactivation, and partial activation all handled correctly.',
-  }
-  var sc = (tc.scenario_type || '').toLowerCase()
-  var base = DMAP[sc] || 'Verifies functional system behaviour as specified.'
-  var e = []
-  if (tc.design_methodology) e.push('Method: ' + tc.design_methodology)
-  if (tc.module)             e.push('Module: ' + tc.module)
-  return e.length ? base + '\n' + e.join(' | ') : base
+  const sc   = (tc.scenario_type || '').toLowerCase()
+  const base = DETAIL_MAP[sc] || 'Verifies functional system behaviour as specified in the requirement.'
+  const extra = []
+  if (tc.design_methodology) extra.push(`Design methodology: ${tc.design_methodology}.`)
+  if (tc.module)             extra.push(`Module under test: ${tc.module}.`)
+  return extra.length ? base + '\n' + extra.join('  ') : base
 }
 
 // ─── COLUMN F: Test Precondition ────────────────────────────────────────────
@@ -118,10 +111,10 @@ function colN(tc) {
   bullets.push(`• Testing Type: ${cap(tc.testing_type)} | Scenario Type: ${cap(tc.scenario_type)}`)
 
   const scWhat = {
-    normal:     'All input values set to nominal/active values; primary output activation is verified.',
-    boundary:   'One input varied at a time (MC/DC); exact min/max/threshold values tested.',
-    edge:       'All inputs inactive simultaneously; conflicting or partial activation combinations tested.',
-    robustness: 'Invalid/out-of-range inputs; missing signals; recovery after fault condition tested.',
+    normal:     'All input values set to normal/valid values; correct system output is verified.',
+    boundary:   'Input boundary values tested: minimum, maximum, min-1, max+1 for each parameter.',
+    edge:       'Edge case conditions tested (state transitions, simultaneous changes, unusual-but-valid states).',
+    robustness: 'Invalid/out-of-range input values tested; system must respond safely without crash.',
     transition: 'State transitions tested: Inactive→Active, Active→Inactive, and partial activation sequences.',
   }
   bullets.push(`• What is tested: ${scWhat[tc.scenario_type] || 'Functional system behaviour verified.'}`)
@@ -150,7 +143,7 @@ function colN(tc) {
 
   const inputsRaw = listToStr(tc.inputs).toLowerCase()
   if (['icd', 'derived', 'interface'].some(kw => inputsRaw.includes(kw))) {
-    bullets.push('• Input source: Values derived from ICD document.')
+    bullets.push('• Input source: Values derived from ICD document (not explicitly defined in SRS).')
   } else {
     bullets.push('• Input source: Input values explicitly defined in SRS specification.')
   }
@@ -167,8 +160,8 @@ function colN(tc) {
     }
   }
 
-  return bullets.join('\n')
-}
+  return bullets.join('\n')   // ← was missing
+}                              // ← was missing (closing brace for colN)
 
 // ─── COLUMN O: Module ───────────────────────────────────────────────────────
 function colO(tc) { return moduleAlphaOnly(tc.module) }

@@ -17,7 +17,7 @@ function setScope(cfg) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function ScopeSelector({ sessionId, onChange }) {
+export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
   const [tab,       setTab]       = useState('all')
   const [reqIds,    setReqIds]    = useState([])
   const [modules,   setModules]   = useState([])
@@ -34,7 +34,8 @@ export default function ScopeSelector({ sessionId, onChange }) {
   useEffect(() => {
     if (!sessionId) return
     setLoading(true); setErr(''); setTab('all')
-    fetch(`/api/scope?session_id=${sessionId}`)
+    const prefixParam = reqPrefixes ? `&req_prefixes=${encodeURIComponent(reqPrefixes)}` : ''
+    fetch(`/api/scope?session_id=${sessionId}${prefixParam}`)
       .then(r => { if (!r.ok) throw new Error('Failed to load scope'); return r.json() })
       .then(d => {
         const ids  = d.requirement_ids || []
@@ -45,7 +46,7 @@ export default function ScopeSelector({ sessionId, onChange }) {
       })
       .catch(e => setErr(e.message))
       .finally(() => setLoading(false))
-  }, [sessionId])
+  }, [sessionId, reqPrefixes])
 
   const switchTab = (t) => {
     setTab(t)

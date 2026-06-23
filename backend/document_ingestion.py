@@ -56,14 +56,7 @@ def _ids_at_line_start(line: str) -> List[str]:
 
     m = _SECTION_ID.match(first_tok)
     if m:
-        # A bare section number (e.g. "1.1", "2.3.4") is only a requirement ID
-        # if the rest of the line contains a requirement keyword.
-        # Without this guard, PDF section headings like "1.1 Introduction"
-        # are wrongly treated as requirement IDs.
-        rest = ' '.join(parts[1:]).lower()
-        _REQ_KW = ('shall', 'must', 'should', 'will ', 'is required', 'has to')
-        if any(kw in rest for kw in _REQ_KW):
-            return [m.group(1)]
+        return [m.group(1)]
 
     if len(parts) >= 2:
         combined = ''.join(parts[:3]).strip('[]().,;:')
@@ -98,10 +91,7 @@ def _all_ids_in_line(line: str) -> List[str]:
         else:
             sm = _SECTION_ID.match(clean)
             if sm:
-                # Only treat section numbers as IDs when they appear
-                # next to a real requirement (not as standalone tokens)
-                # Skip pure section numbers to avoid picking up "1.1", "2.3" etc.
-                pass   # bare section numbers are resolved in _ids_at_line_start only
+                found.append(sm.group(1))
     seen, unique = set(), []
     for x in found:
         key = x.lower()
@@ -243,25 +233,14 @@ def _clean_module_name(raw: str) -> Optional[str]:
     cleaned = ' '.join(raw.split())
     if not cleaned:
         return None
-
-    _NON_REQ = re.compile(
-        r'''^(?:
-            introduction | scope | purpose | overview | background |
-            foreword | preface | summary | executive\s+summary |
-            references? | normative\s+references? | informative\s+references? |
-            applicable\s+documents? | related\s+documents? |
-            definitions? | abbreviations? | acronyms? | glossary | terms? |
-            table\s+of\s+contents? | contents? | index |
-            revision\s+history | change\s+(?:log|history|record) |
-            document\s+(?:history|control|organization|structure) |
-            applicability | general\s+information | general |
-            list\s+of\s+(?:figures?|tables?) | nomenclature | standards?
-        )$''',
-        re.IGNORECASE | re.VERBOSE,
-    )
-    if _NON_REQ.match(cleaned):
-        return None
-
+    # Reject single-word non-descriptive headings that are not real module names
+    _SKIP_WORDS = {
+        'deleted', 'obsolete', 'reserved', 'tbd', 'tbc', 'na', 'none',
+        'yes', 'no', 'general', 'other', 'misc', 'miscellaneous',
+        'placeholder', 'empty', 'blank', 'unknown',
+    }
+    if cleaned.lower() in _SKIP_WORDS:
+        return None  # caller will fall back to inherited or 'General'
     return cleaned
 
 
@@ -355,9 +334,12 @@ def parse_requirements_from_text(text: str) -> List[Dict]:
         else:
             if current_id is not None:
                 current_lines.append(raw)
-                for ref in _all_ids_in_line(raw):
-                    if ref not in current_all_ids:
-                        current_all_ids.append(ref)
+                # Do NOT call _all_ids_in_line on continuation lines.
+                # Body text regularly cross-references other requirement IDs
+                # (e.g. "see also MRJ_MCU_SRS_005") — collecting those into
+                # current_all_ids causes the chunk_data expander in main.py
+                # to generate phantom requirement entries for them (18 vs 11 bug).
+                # Only the IDs on the opening line are real IDs for this chunk.
             else:
                 # Text before any requirement or between requirements
                 between_notes.append(raw)
@@ -477,7 +459,22 @@ def ingest_document(text: str, chunk_size_words: int = 1500) -> List[DocumentChu
                 continue
 
             if _has_decision_table(raw_content):
+                # Decision table — keep everything
                 filtered_content = raw_content
+
+            elif re.search(
+                r'when\s+all\s+(?:the\s+)?following\s+(?:conditions\s+)?(?:are\s+)?(?:met|true|satisfied)',
+                raw_content, re.IGNORECASE
+            ) or re.search(
+                r'when\s+(?:any\s+)?(?:one\s+)?(?:of\s+)?(?:the\s+)?following\s+(?:conditions\s+)?(?:are\s+)?(?:met|true|satisfied)',
+                raw_content, re.IGNORECASE
+            ):
+                # Conditional requirement with bullet-point conditions.
+                # Do NOT filter by _is_req_like — the condition bullets never
+                # contain "shall/must" and would be silently dropped, leaving
+                # _parse_conditional_requirement with incomplete input data.
+                filtered_content = raw_content
+
             else:
                 sentences     = re.split(r'(?<=[.!?])\s+', raw_content)
                 req_sentences = [s.strip() for s in sentences if _is_req_like(s.strip())]
