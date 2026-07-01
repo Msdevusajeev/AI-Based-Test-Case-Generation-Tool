@@ -1,8 +1,0 @@
-2026-06-30 15:22:47,635  INFO  __main__ — [SCOPE-FILTER] prefixes=['REQ_'] → 5 → 5 chunks
-2026-06-30 15:22:55,447  INFO  __main__ — [AI-ENDPOINT] incoming keys=['session_id', 'icd_session_id', 'supporting_session_id', 'selected_req_ids', 'selected_module', 'req_prefixes'] | req_prefixes=['REQ_'] | selected_req_ids=None | session_id='a9e15cef-37f8-44d3-8d97-6dfab059bc7e'
-2026-06-30 15:22:55,450  INFO  __main__ — [PREFIX/AI] ['REQ_'] → 5 → 5 chunks
-2026-06-30 15:22:55,451  INFO  __main__ — [SCOPE/AI] selected_req_ids=None  selected_module='General'  total_chunks=5
-2026-06-30 15:22:55,451  INFO  __main__ — [SCOPE/AI] module filter → 5 → 5 chunks
-2026-06-30 15:22:55,451  INFO  __main__ — AI generation queued: 5 chunks (session=a9e15cef-37f8-44d3-8d97-6dfab059bc7e)
-2026-06-30 15:25:22,177  INFO  __main__ — [CHUNK SAVE] +46 test cases | buffer_total=46 | is_last=True
-2026-06-30 15:25:24,232  INFO  __main__ — [FINALISE] Saved 46 test cases from chunked upload
