@@ -195,7 +195,8 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
               onDrop={e => { e.preventDefault(); Array.from(e.dataTransfer.files).forEach(f => onFile('supporting', f)) }}
             >
               <input id="sup-input" type="file" accept=".pdf,.docx,.xlsx" multiple className="hidden"
-                onChange={e => Array.from(e.target.files).forEach(f => onFile('supporting', f))} />
+                onClick={e => { e.target.value = '' }}
+              onChange={e => Array.from(e.target.files).forEach(f => onFile('supporting', f))} />
               <div className="p-4 flex items-center gap-4">
                 <div className="w-10 h-10 rounded-xl border border-border bg-surface flex items-center justify-center text-xl flex-shrink-0">📋</div>
                 <div>
@@ -284,6 +285,43 @@ function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, on
 
 // ─── Page: Generate ───────────────────────────────────────────────────────────
 
+function TokenUsageWidget({ aiWaiting }) {
+  const [usage, setUsage] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    const poll = () => {
+      fetch('/api/tokens/usage')
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (alive && d) setUsage(d) })
+        .catch(() => {})
+    }
+    poll()
+    const id = setInterval(poll, 3000)
+    return () => { alive = false; clearInterval(id) }
+  }, [aiWaiting])
+
+  if (!usage || usage.calls_made === 0) return null
+
+  const pct = usage.percent_used ?? 0
+  const barColor = pct > 85 ? 'bg-red-500' : pct > 60 ? 'bg-amber' : 'bg-green-500'
+
+  return (
+    <div className="flex items-center gap-3 text-[11px] px-3 py-1.5 rounded-lg bg-card border border-border">
+      <span className="text-dim">
+        ⚡ <strong className="text-text">~{usage.total_tokens_est.toLocaleString()}</strong> tokens used by this generation
+        <span className="text-dim/60"> (input ~{usage.input_tokens_est.toLocaleString()} / output ~{usage.output_tokens_est.toLocaleString()})</span>
+      </span>
+      <div className="flex items-center gap-1.5">
+        <div className="w-20 h-1.5 rounded-full bg-border overflow-hidden">
+          <div className={`h-full ${barColor} transition-all`} style={{ width: `${Math.min(100, pct)}%` }} />
+        </div>
+        <span className="text-dim" title="Estimate based only on tc-tool's own MCP calls — does not include other messages in this Claude Desktop chat">{pct}% of a fresh 200K window</span>
+      </div>
+    </div>
+  )
+}
+
 function PageGenerate({
   testCases, summary, generating, progress, error, aiWaiting,
   uploadDone, onGenerate, onClaudeGenerate, onRemindClaude,
@@ -314,11 +352,15 @@ function PageGenerate({
               <span className="text-[11px] px-2 py-1 rounded-lg bg-green-500/10 border border-green-500/30 text-green-400">
                 ✓ full coverage
               </span>
+              <TokenUsageWidget aiWaiting={aiWaiting} />
             </>
           ) : error ? (
             <span className="text-xs text-red-400">⚠ {error}</span>
           ) : (
-            <span className="text-xs text-dim">{generating ? (progress || 'Generating…') : 'Click Generate to start'}</span>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-dim">{generating ? (progress || 'Generating…') : 'Click Generate to start'}</span>
+              {aiWaiting && <TokenUsageWidget aiWaiting={aiWaiting} />}
+            </div>
           )}
         </div>
 
@@ -744,16 +786,39 @@ export default function App() {
             ...customReviewPoints.map((p, i) => `  ${i + 1}. ${p.label}`),
           ]
         : []
+      // Strategy: for large docs use small batches + save after each
+      // For small docs (<= 30 reqs) do it in one shot
+      const BATCH_SIZE = total > 50 ? 10 : total > 30 ? 15 : total
+      const totalBatches = Math.ceil(total / BATCH_SIZE)
+      const batchSteps = totalBatches > 1
+        ? [
+            `This document has ${total} requirements across ${totalBatches} batches of ${BATCH_SIZE}.`,
+            '',
+            'CRITICAL RULE: Generate AND save each batch before moving to the next.',
+            'Do NOT accumulate test cases across batches. Do NOT wait until the end to save.',
+            '',
+            `STEP 1: Call get_generated_test_cases(batch_index=0, batch_size=${BATCH_SIZE})`,
+            'STEP 2: Generate test cases for ONLY those requirements.',
+            'STEP 3: Immediately call save_enhanced_test_cases(test_cases=[...this batch only...], is_partial=True)',
+            'STEP 4: Repeat steps 1-3 for batch_index 1, 2, 3, ... until is_last_batch=true.',
+            'STEP 5: For the final batch call save_enhanced_test_cases with is_partial=False.',
+            '',
+            '⚠ WARNING: If you accumulate all batches before saving, the payload will exceed the 1MB limit and fail.',
+          ]
+        : [
+            `STEP 1: Call tc-tool get_generated_test_cases with batch_size=${BATCH_SIZE}`,
+            'STEP 2: Generate test cases for every requirement (normal, boundary, edge, robustness).',
+            'STEP 3: Call tc-tool save_enhanced_test_cases with ALL test cases.',
+          ]
       const prompt = [
         'Generate test cases for my SRS document using tc-tool.',
-        '', 'STEP 1: Call tc-tool get_generated_test_cases',
-        '', 'STEP 2: For each requirement generate test cases: normal, boundary, edge, robustness.',
+        '', ...batchSteps, '',
+        'For each requirement generate: normal, boundary, edge, and robustness scenarios.',
         'Every test case MUST have: traceability_req_id, test_case_id, scenario_id,',
         'inputs (["SignalName = Value"]), expected_outcome ("OutputSignal = Value."),',
         'design_methodology, testing_type, scenario_type, priority, objective,',
         'preconditions, test_steps, dependent_test_cases, test_environment, remarks, module',
         ...customPointLines,
-        '', 'STEP 3: Call tc-tool save_enhanced_test_cases with ALL test cases.',
         '', `Total requirements: ${total}`,
       ].join('\n')
       await navigator.clipboard.writeText(prompt).catch(() => {})

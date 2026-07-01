@@ -53,14 +53,26 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="get_generated_test_cases",
             description=(
-                "Extracts structured NLP context from the uploaded SRS document and "
-                "returns it as input for Claude AI to generate test cases from scratch. "
-                "The NLP module identifies requirement sentences, subjects, actions, "
-                "testing types, priorities, and methodologies for each requirement — "
-                "Claude AI uses this context to author all test case fields. "
-                "After generating, call save_enhanced_test_cases with the complete list."
+                "Extracts NLP context from queued SRS requirements. "
+                "For large documents use batch_index+batch_size to avoid the 1MB MCP limit. "
+                "Call repeatedly with batch_index=0,1,2,... until is_last_batch=true. "
+                "After ALL batches done call save_enhanced_test_cases ONCE with all test cases."
             ),
-            inputSchema={"type": "object", "properties": {}}
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "batch_index": {
+                        "type": "integer",
+                        "description": "Zero-based batch number. Start at 0, increment by 1 each call. Default: 0",
+                        "default": 0
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "Requirements per batch. Default 15. Use 10 for complex SRS with long requirements.",
+                        "default": 15
+                    }
+                }
+            }
         ),
 
         types.Tool(
@@ -129,14 +141,20 @@ async def call_tool(
         }, indent=2)
 
     elif name == "get_generated_test_cases":
+        _bi = int(arguments.get("batch_index", 0))
+        _bs = int(arguments.get("batch_size",  15))
         loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _extract_nlp_context_for_queue)
+        result = await loop.run_in_executor(
+            None,
+            lambda: _extract_nlp_context_for_queue(batch_index=_bi, batch_size=_bs)
+        )
 
     elif name == "save_enhanced_test_cases":
         test_cases = arguments.get("test_cases", [])
+        is_partial = bool(arguments.get("is_partial", False))
         loop       = asyncio.get_event_loop()
         result     = await loop.run_in_executor(
-            None, _save_enhanced_cases, test_cases
+            None, lambda: _save_enhanced_cases(test_cases, is_partial=is_partial)
         )
 
     elif name == "generate_for_requirement":
@@ -345,7 +363,7 @@ def _build_required_scenarios(req_id: str, content: str,
     return scenarios
 
 
-def _extract_nlp_context_for_queue() -> str:
+def _extract_nlp_context_for_queue(batch_index: int = 0, batch_size: int = 15) -> str:
     """
     Fetches the AI queue, runs the NLP module to extract structured context
     from each requirement, and returns that context for Claude AI to generate
@@ -391,10 +409,20 @@ def _extract_nlp_context_for_queue() -> str:
                 ),
             })
 
+        # ── Batch slicing ────────────────────────────────────────────────
+        total_reqs    = len(chunks)
+        batch_size    = max(1, batch_size)
+        total_batches = max(1, (total_reqs + batch_size - 1) // batch_size)
+        start         = batch_index * batch_size
+        end           = min(start + batch_size, total_reqs)
+        batch_chunks  = chunks[start:end]
+        is_last_batch = (end >= total_reqs)
+        # ─────────────────────────────────────────────────────────────────
+
         # Extract NLP context from each requirement chunk
         requirements_context = []
 
-        for chunk_data in chunks:
+        for chunk_data in batch_chunks:
             req_id   = chunk_data.get("requirement_id", "REQ-001")
             content  = chunk_data.get("content", "")
             module   = chunk_data.get("module", "General")
@@ -479,10 +507,32 @@ def _extract_nlp_context_for_queue() -> str:
         if not requirements_context:
             return json.dumps({"error": "NLP extraction produced no requirement context"})
 
+        # ── Report estimated input tokens to the backend ──────────────────
+        try:
+            _resp_preview = json.dumps({"requirements": requirements_context})
+            _report_req = urllib.request.Request(
+                f"{BACKEND_URL}/api/tokens/report",
+                data=json.dumps({
+                    "direction": "input",
+                    "chars": len(_resp_preview),
+                    "session_id": data.get("session_id"),
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(_report_req, timeout=5)
+        except Exception:
+            pass  # token reporting is best-effort, never block generation
+        # ─────────────────────────────────────────────────────────────────
+
         return json.dumps({
-            "status": "ready",
-            "total_requirements": len(requirements_context),
-            "requirements": requirements_context,
+            "status":             "ready",
+            "batch_index":        batch_index,
+            "total_batches":      total_batches,
+            "is_last_batch":      is_last_batch,
+            "batch_req_count":    len(requirements_context),
+            "total_requirements": total_reqs,
+            "requirements":       requirements_context,
             "schema": {
                 "description": (
                     "Each requirement contains NLP-extracted context. "
@@ -538,61 +588,82 @@ def _extract_nlp_context_for_queue() -> str:
         return json.dumps({"error": f"NLP extraction failed: {str(e)}"})
 
 
-def _save_enhanced_cases(test_cases: list) -> str:
+def _save_enhanced_cases(test_cases: list, is_partial: bool = False) -> str:
     """
-    Saves Claude's AI-generated test cases to the React UI.
+    Saves test cases incrementally (is_partial=True per batch)
+    or as a final save (is_partial=False, default).
+    Keeps each MCP payload small to avoid the 1MB limit.
     """
     try:
         import urllib.request
-        from collections import Counter
 
         if not test_cases:
             return json.dumps({"error": "No test cases provided"})
 
-        summary = {
-            "total":               len(test_cases),
-            "duplicates_removed":  0,
-            "by_module":           dict(Counter(tc.get("module", "General") for tc in test_cases)),
-            "by_requirement_type": dict(Counter(tc.get("requirement_type", "functional") for tc in test_cases)),
-            "by_scenario_type":    dict(Counter(tc.get("scenario_type", "normal") for tc in test_cases)),
-            "by_testing_type":     dict(Counter(tc.get("testing_type", "verification") for tc in test_cases)),
-            "by_priority":         dict(Counter(tc.get("priority", "P1") for tc in test_cases)),
-        }
+        # ── Report estimated output tokens ───────────────────────────────
+        try:
+            _tc_preview = json.dumps(test_cases)
+            _report_req = urllib.request.Request(
+                f"{BACKEND_URL}/api/tokens/report",
+                data=json.dumps({
+                    "direction": "output",
+                    "chars": len(_tc_preview),
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(_report_req, timeout=5)
+        except Exception:
+            pass
+        # ───────────────────────────────────────────────────────────────
 
-        payload = json.dumps({
+        # Send this batch to the backend chunk buffer
+        chunk_payload = json.dumps({
             "test_cases": test_cases,
-            "summary":    summary,
+            "is_last": not is_partial,
         }).encode("utf-8")
-
-        # Save to React UI
-        save_req = urllib.request.Request(
-            f"{BACKEND_URL}/api/mcp/save",
-            data    = payload,
-            headers = {"Content-Type": "application/json"},
-            method  = "POST",
+        chunk_req = urllib.request.Request(
+            f"{BACKEND_URL}/api/mcp/save_chunk",
+            data=chunk_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        urllib.request.urlopen(save_req, timeout=10)
+        urllib.request.urlopen(chunk_req, timeout=120)
 
-        # Mark queue complete
+        if is_partial:
+            # More batches coming — just acknowledge
+            return json.dumps({
+                "status": "partial_saved",
+                "message": f"{len(test_cases)} test cases buffered. Continue with next batch.",
+            })
+
+        # Final batch — merge all chunks and mark complete
+        fin_req = urllib.request.Request(
+            f"{BACKEND_URL}/api/mcp/save_finalise",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(fin_req, timeout=120)
+
         done_req = urllib.request.Request(
             f"{BACKEND_URL}/api/ai/complete",
-            data    = b"{}",
-            headers = {"Content-Type": "application/json"},
-            method  = "POST",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        urllib.request.urlopen(done_req, timeout=10)
+        urllib.request.urlopen(done_req, timeout=60)
 
         return json.dumps({
-            "status":  "saved",
-            "total":   len(test_cases),
-            "message": (
-                f"All {len(test_cases)} AI-generated test cases saved to React UI. "
-                f"Open http://localhost:5173 — the results banner will appear."
-            ),
-        }, indent=2)
+            "status": "saved",
+            "message": "All test cases saved. Click Load Results in the tool.",
+        })
 
     except Exception as e:
-        return json.dumps({"error": f"Save failed: {str(e)}"})
+        return json.dumps({
+            "error": f"Save failed: {str(e)}",
+            "tip": "Retry save_enhanced_test_cases — your generated test cases are not lost.",
+        })
 
 
 def _extract_and_generate_single(req_text: str, req_id: str, module: str) -> str:

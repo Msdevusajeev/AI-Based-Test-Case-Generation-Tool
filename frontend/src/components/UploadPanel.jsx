@@ -54,6 +54,7 @@ function FileDropZone({ docType, file, loading, error, onFile, onClear }) {
           type="file"
           accept=".pdf,.docx,.xlsx"
           className="hidden"
+          onClick={(e) => { e.target.value = '' }}
           onChange={(e) => onFile(e.target.files[0])}
         />
 

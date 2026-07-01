@@ -83,6 +83,22 @@ mcp_results_store: Dict[str, Any] = {
 
 # ─── AI GENERATION QUEUE ──────────────────────────────────────────────────────
 # React UI writes chunks here → Claude Desktop reads via MCP
+# ── Token usage tracking (estimated — Claude Desktop does not expose exact "
+# usage to MCP servers, so we estimate from payload sizes using the standard
+# ~4 chars/token heuristic for English text) ─────────────────────────────────
+token_usage: Dict[str, Any] = {
+    "session_id":      None,
+    "input_tokens_est":  0,
+    "output_tokens_est": 0,
+    "context_budget":   200_000,  # Claude Desktop context window
+    "calls_made":       0,
+}
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate using ~4 chars/token heuristic (Claude-family average)."""
+    return max(1, len(text) // 4)
+
+
 generation_queue: Dict[str, Any] = {
     "chunks":     [],
     "session_id": None,
@@ -507,6 +523,81 @@ async def debug_last_request():
     return _last_ai_request
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+
+# ── Module-based generation progress tracking ─────────────────────────────────
+_module_progress: dict = {}   # {session_id: {module_name: "pending"|"done"}}
+
+@app.get("/api/session/modules")
+async def get_session_modules(session_id: str, req_prefixes: str = ""):
+    """Returns all modules in the session with req counts. Use for module-by-module generation."""
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    text = session.get("text", "")
+    chunks = ingest_document(text)
+    prefixes = [p.strip() for p in req_prefixes.split(",") if p.strip()] if req_prefixes else []
+    if prefixes:
+        chunks = [c for c in chunks if c.requirement_ids and
+                  any(c.requirement_ids[0].startswith(px) for px in prefixes)]
+    from collections import Counter
+    module_counts = Counter(c.module or "General" for c in chunks)
+    progress = _module_progress.get(session_id, {})
+    return {
+        "total_requirements": len(chunks),
+        "total_modules": len(module_counts),
+        "modules": [
+            {
+                "name": mod,
+                "req_count": count,
+                "status": progress.get(mod, "pending"),
+            }
+            for mod, count in sorted(module_counts.items(), key=lambda x: -x[1])
+        ],
+    }
+
+
+@app.post("/api/session/module_done")
+async def mark_module_done(request: Request):
+    """Mark a module as done after its test cases are saved."""
+    data = await request.json()
+    session_id = data.get("session_id")
+    module_name = data.get("module")
+    if session_id and module_name:
+        if session_id not in _module_progress:
+            _module_progress[session_id] = {}
+        _module_progress[session_id][module_name] = "done"
+    return {"status": "ok", "module": module_name}
+
+
+@app.get("/api/session/progress")
+async def get_progress(session_id: str):
+    """Returns which modules are done vs pending."""
+    return _module_progress.get(session_id, {})
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DEBUG endpoint: shows exactly what ingest_document returns ───────────────
+@app.get("/api/debug/ingest")
+async def debug_ingest(session_id: str, req_prefix: str = ""):
+    """Call with ?session_id=XXX&req_prefix=MRJ_SCU_STC_SRS_"""
+    session = sessions.get(session_id)
+    if not session:
+        return {"error": "session not found", "available": list(sessions.keys())}
+    text = session.get("text", "")
+    chunks = ingest_document(text)
+    all_ids = [c.requirement_ids[0] if c.requirement_ids else "?" for c in chunks]
+    filtered = [i for i in all_ids if i.startswith(req_prefix)] if req_prefix else all_ids
+    return {
+        "total_chunks": len(chunks),
+        "total_matching_prefix": len(filtered),
+        "prefix_used": req_prefix,
+        "first_20_all_ids": all_ids[:20],
+        "first_20_filtered": filtered[:20],
+        "document_ingestion_file": __import__('document_ingestion').__file__,
+    }
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─── GENERATE (Claude AI) ─────────────────────────────────────────────────────
 
 @app.post("/api/generate/ai")
@@ -725,6 +816,57 @@ async def save_mcp_results(request: Request):
     return {"status": "saved", "total": len(mcp_results_store["test_cases"])}
 
 
+# ── Chunked save endpoints for large test case batches ───────────────────────
+# mcp_server.py calls these instead of /api/mcp/save when is_partial is used,
+# so each MCP call stays well under the 1MB payload limit.
+_chunk_buffer: list = []
+
+@app.post("/api/mcp/save_chunk")
+async def save_chunk(request: Request):
+    """Receives one batch of test cases. Buffers them in memory.
+    Called once per batch. Use is_last=True on the final batch."""
+    global _chunk_buffer
+    data = await request.json()
+    chunk = data.get("test_cases", [])
+    is_last = data.get("is_last", False)
+    _chunk_buffer.extend(chunk)
+    logger.info(f"[CHUNK SAVE] +{len(chunk)} test cases | buffer_total={len(_chunk_buffer)} | is_last={is_last}")
+    return {"status": "chunk_received", "buffer_total": len(_chunk_buffer), "is_last": is_last}
+
+
+@app.post("/api/mcp/save_finalise")
+async def save_finalise():
+    """Merges all buffered chunks into mcp_results_store and completes the queue.
+    Called once after the final batch's save_chunk."""
+    global _chunk_buffer
+    from collections import Counter
+
+    test_cases = list(_chunk_buffer)
+    _chunk_buffer = []
+
+    if not test_cases:
+        raise HTTPException(status_code=400, detail="No chunks buffered. Send chunks via save_chunk first.")
+
+    summary = {
+        "total":               len(test_cases),
+        "duplicates_removed":  0,
+        "by_module":           dict(Counter(tc.get("module", "General")            for tc in test_cases)),
+        "by_requirement_type": dict(Counter(tc.get("requirement_type", "functional") for tc in test_cases)),
+        "by_scenario_type":    dict(Counter(tc.get("scenario_type", "normal")        for tc in test_cases)),
+        "by_testing_type":     dict(Counter(tc.get("testing_type", "verification")   for tc in test_cases)),
+        "by_priority":         dict(Counter(tc.get("priority", "P1")                 for tc in test_cases)),
+    }
+
+    mcp_results_store["test_cases"] = test_cases
+    mcp_results_store["summary"]    = summary
+    mcp_results_store["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generation_queue["status"]      = "complete"
+
+    logger.info(f"[FINALISE] Saved {len(test_cases)} test cases from chunked upload")
+    return {"status": "finalised", "total": len(test_cases), "summary": summary}
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @app.get("/api/export/excel/mcp")
 def export_mcp_excel():
     """Exports Claude Desktop MCP results as Excel"""
@@ -812,6 +954,46 @@ def get_ai_queue():
         "chunks": generation_queue["chunks"],
         "status": generation_queue["status"],
         "total":  len(generation_queue["chunks"]),
+    }
+
+
+@app.post("/api/tokens/report")
+async def report_tokens(request: Request):
+    """
+    mcp_server.py calls this after each get_generated_test_cases / 
+    save_enhanced_test_cases call to report estimated token usage.
+    """
+    data = await request.json()
+    direction = data.get("direction")  # "input" or "output"
+    chars     = data.get("chars", 0)
+    est_tokens = _estimate_tokens(" " * chars)  # reuse same heuristic via char count
+
+    if token_usage["session_id"] != data.get("session_id"):
+        # New session — reset counters
+        token_usage["session_id"]        = data.get("session_id")
+        token_usage["input_tokens_est"]  = 0
+        token_usage["output_tokens_est"] = 0
+        token_usage["calls_made"]        = 0
+
+    if direction == "input":
+        token_usage["input_tokens_est"] += est_tokens
+    elif direction == "output":
+        token_usage["output_tokens_est"] += est_tokens
+    token_usage["calls_made"] += 1
+
+    return {"status": "ok", **token_usage}
+
+
+@app.get("/api/tokens/usage")
+def get_token_usage():
+    """Frontend polls this to show live token usage in the Generate tab."""
+    total_used = token_usage["input_tokens_est"] + token_usage["output_tokens_est"]
+    budget     = token_usage["context_budget"]
+    return {
+        **token_usage,
+        "total_tokens_est": total_used,
+        "tokens_remaining_est": max(0, budget - total_used),
+        "percent_used": round(min(100, (total_used / budget) * 100), 1),
     }
 
 
