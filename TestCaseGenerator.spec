@@ -15,6 +15,7 @@ a = Analysis(
         ('backend/output_generator.py',     'backend'),
         ('backend/mcp_server.py',           'backend'),
         ('backend/mcp_client.py',           'backend'),
+        ('backend/output_validator.py',      'backend'),
     ],
     hiddenimports=[
         'uvicorn',
@@ -42,6 +43,8 @@ a = Analysis(
         'openpyxl.utils',
         'statistics',
         'difflib',
+        'subprocess',
+        'pathlib',
         'multipart',
         'python_multipart',
     ],

@@ -343,7 +343,6 @@ export default function ResultsTable({ testCases }) {
           </div>
           <FilterSelect k="requirement_id"   label="Req ID" />
           <FilterSelect k="module"           label="Module" />
-          <FilterSelect k="priority"         label="Priority" />
           <FilterSelect k="scenario_type"    label="Scenario" />
           <FilterSelect k="testing_type"     label="Testing Type" />
           <FilterSelect k="requirement_type" label="Req Type" />

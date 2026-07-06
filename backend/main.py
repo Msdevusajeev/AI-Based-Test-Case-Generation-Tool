@@ -1,4 +1,5 @@
 import logging
+import subprocess
 import os
 import re
 import sys
@@ -38,6 +39,7 @@ from models import (
 from config import ENGINE, VERSION, CHUNK_SIZE_WORDS, MCP_ENABLED
 from file_parser import parse_file
 from document_ingestion import ingest_document
+from output_validator   import validate_test_cases
 from test_case_generator import generate_all, is_spacy_available
 from output_generator import generate_excel, generate_docx
 
@@ -577,6 +579,78 @@ async def get_progress(session_id: str):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Open Claude Desktop endpoint ─────────────────────────────────────────────
+@app.post("/api/open-claude")
+async def open_claude():
+    """
+    Brings Claude Desktop to front using PowerShell AppActivate.
+    Writes a temp PS1 script and runs it via powershell.exe directly
+    (not via cmd or schtasks) to preserve the interactive desktop context.
+    """
+    import pathlib, tempfile, os
+
+    ps_script = """
+$proc = Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq 'Claude'} | Select-Object -First 1
+if ($proc) {
+    $wshell = New-Object -ComObject WScript.Shell
+    # Bring Claude to front
+    $wshell.AppActivate($proc.Id)
+    Start-Sleep -Milliseconds 800
+    # Open a new chat
+    $wshell.SendKeys('^n')
+    Start-Sleep -Milliseconds 2000
+    # Bring focus again — new chat may shift focus
+    $wshell.AppActivate('Claude')
+    Start-Sleep -Milliseconds 500
+    # Paste the clipboard prompt
+    $wshell.SendKeys('^v')
+    Start-Sleep -Milliseconds 800
+    # Press Enter to start generation
+    $wshell.SendKeys('~')
+} else {
+    # Claude not running — launch it, wait for load, then paste
+    explorer.exe 'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
+    Start-Sleep -Seconds 6
+    $wshell2 = New-Object -ComObject WScript.Shell
+    $wshell2.AppActivate('Claude')
+    Start-Sleep -Milliseconds 1000
+    $wshell2.SendKeys('^n')
+    Start-Sleep -Milliseconds 2000
+    $wshell2.AppActivate('Claude')
+    Start-Sleep -Milliseconds 500
+    $wshell2.SendKeys('^v')
+    Start-Sleep -Milliseconds 800
+    $wshell2.SendKeys('~')
+}
+"""
+
+    try:
+        # Write PS1 to temp file
+        tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.ps1', delete=False, encoding='utf-8'
+        )
+        tmp.write(ps_script)
+        tmp.close()
+
+        # Run with powershell.exe directly — preserves desktop session
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-WindowStyle", "Hidden",
+                "-ExecutionPolicy", "Bypass",
+                "-File", tmp.name
+            ],
+            shell=False
+        )
+        logger.info(f"[OPEN-CLAUDE] PS1 launched: {tmp.name}")
+        return {"status": "launched", "method": "powershell_ps1"}
+
+    except Exception as e:
+        logger.warning(f"[OPEN-CLAUDE] PS1 failed: {e}")
+        return {"status": "error", "message": str(e)}
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── DEBUG endpoint: shows exactly what ingest_document returns ───────────────
 @app.get("/api/debug/ingest")
 async def debug_ingest(session_id: str, req_prefix: str = ""):
@@ -808,12 +882,24 @@ async def save_mcp_results(request: Request):
     """Called by mcp_server.py after Claude Desktop generates test cases.
     Stores results so React UI can display and download them"""
     data = await request.json()
-    mcp_results_store["test_cases"] = data.get("test_cases", [])
+    raw_tcs = data.get("test_cases", [])
+    queued_req_ids = {
+        c.get("requirement_id") for c in generation_queue.get("chunks", [])
+        if c.get("requirement_id")
+    }
+    report = validate_test_cases(raw_tcs, valid_req_ids=queued_req_ids or None)
+    _last_validation_report.update(report.summary())
+    validated_tcs = report.valid_test_cases
+    mcp_results_store["test_cases"] = validated_tcs
     mcp_results_store["summary"]    = data.get("summary", {})
     mcp_results_store["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     generation_queue["status"]      = "complete"
-    logger.info(f"MCP results saved: {len(mcp_results_store['test_cases'])} test cases")
-    return {"status": "saved", "total": len(mcp_results_store["test_cases"])}
+    logger.info(
+        f"MCP results saved: {len(validated_tcs)} test cases "
+        f"(fixed={report.auto_fixed}, dropped={report.dropped})"
+    )
+    return {"status": "saved", "total": len(validated_tcs),
+            "validation": _last_validation_report}
 
 
 # ── Chunked save endpoints for large test case batches ───────────────────────
@@ -847,6 +933,23 @@ async def save_finalise():
     if not test_cases:
         raise HTTPException(status_code=400, detail="No chunks buffered. Send chunks via save_chunk first.")
 
+    # ── OUTPUT VALIDATION ────────────────────────────────────────────────
+    # Get valid req IDs from the generation queue for traceability check
+    queued_req_ids = {
+        c.get("requirement_id") for c in generation_queue.get("chunks", [])
+        if c.get("requirement_id")
+    }
+    report = validate_test_cases(test_cases, valid_req_ids=queued_req_ids or None)
+    _last_validation_report.update(report.summary())
+    test_cases = report.valid_test_cases  # use validated + fixed list
+
+    if report.dropped > 0:
+        logger.warning(
+            f"[VALIDATION] Dropped {report.dropped} malformed test cases. "
+            f"Errors: {report.summary()['error_count']}"
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     summary = {
         "total":               len(test_cases),
         "duplicates_removed":  0,
@@ -855,6 +958,7 @@ async def save_finalise():
         "by_scenario_type":    dict(Counter(tc.get("scenario_type", "normal")        for tc in test_cases)),
         "by_testing_type":     dict(Counter(tc.get("testing_type", "verification")   for tc in test_cases)),
         "by_priority":         dict(Counter(tc.get("priority", "P1")                 for tc in test_cases)),
+        "validation":          _last_validation_report,
     }
 
     mcp_results_store["test_cases"] = test_cases
@@ -862,8 +966,12 @@ async def save_finalise():
     mcp_results_store["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     generation_queue["status"]      = "complete"
 
-    logger.info(f"[FINALISE] Saved {len(test_cases)} test cases from chunked upload")
-    return {"status": "finalised", "total": len(test_cases), "summary": summary}
+    logger.info(
+        f"[FINALISE] Saved {len(test_cases)} validated test cases "
+        f"(fixed={report.auto_fixed}, dropped={report.dropped})"
+    )
+    return {"status": "finalised", "total": len(test_cases),
+            "summary": summary, "validation": _last_validation_report}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -956,6 +1064,57 @@ def get_ai_queue():
         "total":  len(generation_queue["chunks"]),
     }
 
+
+# ── Validation report store ───────────────────────────────────────────────────
+_last_validation_report: dict = {}
+
+@app.get("/api/debug/claude-launch")
+async def debug_claude_launch():
+    """Test endpoint - shows exactly what happens when we try to launch Claude."""
+    import sys, os
+    APP_ID = "Claude_pzs8sxrjxfjjc!Claude"
+    results = {}
+
+    # Test 1: schtasks create
+    try:
+        cmd = f'explorer.exe "shell:AppsFolder\\{APP_ID}"'
+        r1 = subprocess.run(
+            ["schtasks", "/create", "/tn", "OpenClaudeTest", "/tr", cmd,
+             "/sc", "ONCE", "/st", "00:00", "/f"],
+            capture_output=True, text=True, timeout=10
+        )
+        results["schtasks_create"] = {"rc": r1.returncode, "out": r1.stdout, "err": r1.stderr}
+    except Exception as e:
+        results["schtasks_create"] = {"error": str(e)}
+
+    # Test 2: schtasks run
+    try:
+        r2 = subprocess.run(
+            ["schtasks", "/run", "/tn", "OpenClaudeTest"],
+            capture_output=True, text=True, timeout=10
+        )
+        results["schtasks_run"] = {"rc": r2.returncode, "out": r2.stdout, "err": r2.stderr}
+    except Exception as e:
+        results["schtasks_run"] = {"error": str(e)}
+
+    # Test 3: session info
+    try:
+        r3 = subprocess.run(["query", "session"], capture_output=True, text=True, timeout=5)
+        results["sessions"] = r3.stdout
+    except Exception as e:
+        results["sessions"] = str(e)
+
+    results["pid"] = os.getpid()
+    results["user"] = os.environ.get("USERNAME", "unknown")
+    results["session_id"] = os.environ.get("SESSIONNAME", "unknown")
+    return results
+
+@app.get("/api/validation/report")
+async def get_validation_report():
+    """Returns the validation report from the last save_finalise call."""
+    return _last_validation_report or {"message": "No validation report yet"}
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/tokens/report")
 async def report_tokens(request: Request):

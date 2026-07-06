@@ -553,7 +553,7 @@ function PageExport({ testCases, summary, sessionId, exportSource }) {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
               {[
                 { label: 'Total test cases', value: summary.total },
-                { label: 'Requirements covered', value: Object.keys(summary.by_module || {}).length },
+                { label: 'Requirements covered', value: new Set((testCases || []).map(tc => tc.traceability_req_id).filter(Boolean)).size },
                 { label: 'Duplicates removed', value: dupCount, red: dupCount > 0 },
                 { label: 'Scenario types', value: Object.keys(summary.by_scenario_type || {}).length },
               ].map(s => (
@@ -642,12 +642,6 @@ export default function App() {
   const [mcpResults,   setMcpResults]   = useState(null)
   const [aiWaiting,    setAiWaiting]    = useState(false)
   const [exportSource, setExportSource] = useState('session')
-
-  const [showModal,    setShowModal]    = useState(false)
-  const [modalChunks,  setModalChunks]  = useState(0)
-  const [dontAskAgain, setDontAskAgain] = useState(
-    () => localStorage.getItem('claudeModalDismissed') === 'true'
-  )
 
   useEffect(() => {
     fetch('/api/mode').then(r => r.ok ? r.json() : null).then(d => { if (d) setMode(d) }).catch(() => {})
@@ -778,7 +772,6 @@ export default function App() {
       if (!qRes.ok) { setError(qData?.detail?.suggestion || 'Failed to queue'); return }
       const total = qData.total_chunks ?? 0
       if (!total) { setError('No requirements found.'); return }
-      setModalChunks(total)
       const customPointLines = customReviewPoints.length > 0
         ? [
             '',
@@ -823,8 +816,10 @@ export default function App() {
       ].join('\n')
       await navigator.clipboard.writeText(prompt).catch(() => {})
       setAiWaiting(true)
-      setShowModal(true)   // always show steps popup when user selects Claude AI
       setTab('generate')
+      // Directly launch Claude Desktop and run the full paste+send automation.
+      // (Previously this was gated behind a manual popup + button click.)
+      await fetch('/api/open-claude', { method: 'POST' }).catch(() => {})
     } catch (e) { setError(e.message) }
   }
 
@@ -849,31 +844,6 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-bg text-text font-sans overflow-hidden">
-
-      {/* Claude modal */}
-      {showModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div className="bg-surface border border-border rounded-2xl shadow-2xl w-80 mx-4 p-5">
-            <p className="text-sm font-semibold mb-2">{modalChunks} requirement(s) queued!</p>
-            <ol className="text-xs text-dim space-y-1 mb-4 list-decimal list-inside">
-              <li>Open Claude Desktop</li><li>Start a New Chat</li>
-              <li>Press Ctrl+V to paste</li><li>Press Enter</li>
-            </ol>
-            <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
-              <input type="checkbox" checked={dontAskAgain}
-                onChange={e => setDontAskAgain(e.target.checked)}
-                className="accent-amber w-3.5 h-3.5 cursor-pointer" />
-              <span className="text-xs text-dim">Don't show again</span>
-            </label>
-            <div className="flex justify-end">
-              <button onClick={() => {
-                if (dontAskAgain) localStorage.setItem('claudeModalDismissed', 'true')
-                setShowModal(false)
-              }} className="px-4 py-1.5 rounded-lg bg-amber text-bg text-sm font-semibold">OK</button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Top bar ── */}
       <header className="flex-shrink-0 border-b border-border bg-surface z-10">
