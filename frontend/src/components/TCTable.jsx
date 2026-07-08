@@ -345,10 +345,9 @@ export default function ResultsTable({ testCases }) {
           <FilterSelect k="module"           label="Module" />
           <FilterSelect k="scenario_type"    label="Scenario" />
           <FilterSelect k="testing_type"     label="Testing Type" />
-          <FilterSelect k="requirement_type" label="Req Type" />
           <button
             onClick={() => {
-              setFilters({ requirement_id: 'All', module: 'All', priority: 'All', scenario_type: 'All', testing_type: 'All', requirement_type: 'All' })
+              setFilters({ requirement_id: 'All', module: 'All', scenario_type: 'All', testing_type: 'All' })
               setSearch(''); setPage(1)
             }}
             className="text-xs text-muted hover:text-amber transition-colors self-end pb-1.5"

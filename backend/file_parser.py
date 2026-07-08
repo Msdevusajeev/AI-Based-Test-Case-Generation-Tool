@@ -173,10 +173,21 @@ def parse_docx(file_bytes: bytes) -> str:
                 _lm = _re.match(r"Heading (\d+)", style_name)
                 _level = int(_lm.group(1)) if _lm else 99
                 if text.strip().lower() not in _SKIP_HEADING_WORDS:
-                    parts.append(f"[MODULE: {text}]")
                     _heading_stack[_level] = text
                     for _l in list(_heading_stack):
                         if _l > _level: del _heading_stack[_l]
+                    # Build module name: "H3 > H4" when both exist, else just current
+                    _sorted_levels = sorted(
+                        [_l for _l in _heading_stack if _heading_stack[_l]]
+                    )
+                    if len(_sorted_levels) >= 2:
+                        # Use the two deepest valid headings
+                        _h_parent = _heading_stack[_sorted_levels[-2]]
+                        _h_child  = _heading_stack[_sorted_levels[-1]]
+                        _module_name = f"{_h_parent} > {_h_child}"
+                    else:
+                        _module_name = text
+                    parts.append(f"[MODULE: {_module_name}]")
                 else:
                     # Skipped heading — re-emit nearest valid parent as MODULE
                     _parent = next(

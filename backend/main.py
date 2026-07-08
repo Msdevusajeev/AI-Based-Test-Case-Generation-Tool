@@ -1,3 +1,4 @@
+import json
 import logging
 import subprocess
 import os
@@ -106,6 +107,79 @@ generation_queue: Dict[str, Any] = {
     "session_id": None,
     "status":     "idle",   # idle / queued / complete
 }
+
+
+# ─── REQUIREMENTS-COVERAGE HELPERS ────────────────────────────────────────────
+# "Requirements covered" must reflect how many *in-scope SRS requirements* have
+# at least one generated test case — NOT the raw count of distinct req IDs that
+# happen to appear on the test cases. Test-case IDs can be blank, placeholder
+# ("REQ-001"), or format-variant ("MRJ-MCU-SRS-001" vs "MRJ_MCU_SRS_001"), which
+# both over- and under-counts. We canonicalise both sides and intersect.
+
+def _canon_req_id(rid) -> str:
+    """Canonical form of a requirement ID: upper-cased, separators unified."""
+    return re.sub(r"[\s_\-]+", "_", str(rid or "").upper().strip())
+
+
+def _coverage(srs_req_ids, test_cases) -> Dict[str, int]:
+    """
+    Given the authoritative in-scope SRS requirement IDs and the generated test
+    cases, return {'requirements_total', 'requirements_covered'}.
+
+    total    = distinct in-scope SRS requirements
+    covered  = those SRS requirements that have >=1 test case tracing to them
+    """
+    srs = {_canon_req_id(r) for r in (srs_req_ids or []) if _canon_req_id(r)}
+    tc_ids = {
+        _canon_req_id(tc.get("traceability_req_id") if isinstance(tc, dict)
+                      else getattr(tc, "traceability_req_id", ""))
+        for tc in (test_cases or [])
+    }
+    tc_ids.discard("")
+    if srs:
+        return {"requirements_total": len(srs),
+                "requirements_covered": len(srs & tc_ids)}
+    # No authoritative SRS set available (e.g. queue empty): fall back to the
+    # distinct traceable IDs on the test cases so the card still shows something.
+    return {"requirements_total": len(tc_ids),
+            "requirements_covered": len(tc_ids)}
+
+
+def _tc_identity(tc) -> str:
+    """Stable identity for a test case, used to dedupe when batches are merged.
+
+    Prefers the explicit IDs the generator assigns. Falls back to a content
+    hash so that even ID-less rows are not silently collapsed into one another.
+    """
+    if not isinstance(tc, dict):
+        return "obj:" + str(id(tc))
+    tcid = str(tc.get("test_case_id") or "").strip()
+    scid = str(tc.get("scenario_id") or "").strip()
+    rid  = _canon_req_id(tc.get("traceability_req_id"))
+    if tcid or scid:
+        return f"{rid}|{tcid}|{scid}"
+    # No usable IDs — hash the whole row so distinct content stays distinct.
+    import hashlib
+    blob = json.dumps(tc, sort_keys=True, default=str)
+    return "hash:" + hashlib.md5(blob.encode("utf-8")).hexdigest()
+
+
+def _merge_test_cases(existing, incoming) -> list:
+    """Append incoming test cases to existing, dropping exact duplicates.
+
+    Order-preserving: existing rows keep their position, genuinely new rows are
+    appended in arrival order. This is what lets multiple batches accumulate
+    regardless of how (or how often) the generator saves them.
+    """
+    merged = list(existing or [])
+    seen   = {_tc_identity(tc) for tc in merged}
+    for tc in (incoming or []):
+        ident = _tc_identity(tc)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        merged.append(tc)
+    return merged
 
 
 # ─── MCP RESULT NORMALISER ────────────────────────────────────────────────────
@@ -387,7 +461,8 @@ def get_scope(session_id: str = Query(...), req_prefixes: str = Query(default=""
     seen_r:  set  = set()
     seen_m:  set  = set()
 
-    for c in sorted(chunks, key=lambda x: (x.requirement_ids[0] if x.requirement_ids else "")):
+    # Preserve document order — do NOT sort chunks or modules
+    for c in chunks:
         rid = c.requirement_ids[0] if c.requirement_ids else None
         if rid and rid not in seen_r:
             seen_r.add(rid)
@@ -397,7 +472,7 @@ def get_scope(session_id: str = Query(...), req_prefixes: str = Query(default=""
             seen_m.add(mod)
             modules.append(mod)
 
-    return {"requirement_ids": req_ids, "modules": sorted(modules)}
+    return {"requirement_ids": req_ids, "modules": modules}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +504,18 @@ def generate(request: GenerateRequest):
         # confuse the parser and create phantom requirement chunks.
         chunks = ingest_document(text, CHUNK_SIZE_WORDS)
 
+        # ── Requirement ID prefix filter (rule-based) ────────────────────────
+        req_prefixes = getattr(request, "req_prefixes", None) or []
+        if req_prefixes:
+            prefixes = [p.strip() for p in req_prefixes if p.strip()]
+            if prefixes:
+                before_pf = len(chunks)
+                chunks = [c for c in chunks
+                          if c.requirement_ids and
+                          any(c.requirement_ids[0].startswith(px) for px in prefixes)]
+                logger.info(f"[PREFIX/NLP] {prefixes} → {before_pf} → {len(chunks)} chunks")
+        # ─────────────────────────────────────────────────────────────────────
+
         # ── Scope filter ─────────────────────────────────────────────────────
         # If the user selected specific requirement IDs, keep only those chunks.
         # If the user selected a module, keep only chunks for that module.
@@ -443,11 +530,15 @@ def generate(request: GenerateRequest):
             chunks = [c for c in chunks
                       if any(rid in keep for rid in c.requirement_ids)]
             logger.info(f"[SCOPE] req filter → {before} → {len(chunks)} chunks | keep={keep}")
-        elif request.selected_module and request.selected_module != "__all__":
+        elif (request.selected_modules or request.selected_module) and \
+             request.selected_module != "__all__":
+            # Support both single module and multi-module selection
+            mods = set(request.selected_modules or [])
+            if request.selected_module and request.selected_module not in mods:
+                mods.add(request.selected_module)
             before = len(chunks)
-            chunks = [c for c in chunks
-                      if (c.module or "General") == request.selected_module]
-            logger.info(f"[SCOPE] module filter → {before} → {len(chunks)} chunks")
+            chunks = [c for c in chunks if (c.module or "General") in mods]
+            logger.info(f"[SCOPE] module filter {mods} → {before} → {len(chunks)} chunks")
         else:
             logger.info(f"[SCOPE] no filter — generating for all {len(chunks)} chunks")
         # ─────────────────────────────────────────────────────────────────────
@@ -492,6 +583,15 @@ def generate(request: GenerateRequest):
         sessions[request.session_id]["test_cases"] = test_cases
         sessions[request.session_id]["removed"]    = removed
 
+        # In-scope SRS requirements = PRIMARY requirement ID per chunk only.
+        # Using all requirement_ids inflates the count with cross-reference
+        # labels (e.g. "B4", "B5") that are not real requirements.
+        srs_req_ids = {
+            c.requirement_ids[0] for c in chunks
+            if c.requirement_ids and c.requirement_ids[0]
+        }
+        cov = _coverage(srs_req_ids, test_cases)
+
         summary = GenerateSummary(
             total               = len(test_cases),
             by_module           = dict(Counter(tc.module           for tc in test_cases)),
@@ -500,6 +600,8 @@ def generate(request: GenerateRequest):
             by_testing_type     = dict(Counter(tc.testing_type     for tc in test_cases)),
             by_priority         = dict(Counter(tc.priority         for tc in test_cases)),
             duplicates_removed  = removed,
+            requirements_total   = cov["requirements_total"],
+            requirements_covered = cov["requirements_covered"],
         )
 
         return GenerateResponse(test_cases=test_cases, summary=summary)
@@ -738,6 +840,7 @@ async def generate_ai(request: Request):
         # ── Scope filter for Claude AI (same logic as rule-based) ─────────────
         selected_req_ids = data.get("selected_req_ids")   # list or None
         selected_module  = data.get("selected_module")    # str or None
+        selected_modules = data.get("selected_modules")   # list or None
 
         # ── Requirement ID prefix filter ─────────────────────────────────
         req_prefixes = data.get("req_prefixes") or []
@@ -762,11 +865,13 @@ async def generate_ai(request: Request):
             chunks = [c for c in chunks
                       if any(rid in keep for rid in (c.requirement_ids or []))]
             logger.info(f"[SCOPE/AI] req filter → {before} → {len(chunks)} chunks | keep={keep}")
-        elif selected_module and selected_module != "__all__":
+        elif (selected_modules or selected_module) and selected_module != "__all__":
+            mods = set(selected_modules or [])
+            if selected_module and selected_module not in mods:
+                mods.add(selected_module)
             before = len(chunks)
-            chunks = [c for c in chunks
-                      if (c.module or "General") == selected_module]
-            logger.info(f"[SCOPE/AI] module filter → {before} → {len(chunks)} chunks")
+            chunks = [c for c in chunks if (c.module or "General") in mods]
+            logger.info(f"[SCOPE/AI] module filter {mods} → {before} → {len(chunks)} chunks")
         else:
             logger.info(f"[SCOPE/AI] no filter — queuing all {len(chunks)} chunks")
         # ─────────────────────────────────────────────────────────────────────
@@ -801,7 +906,12 @@ async def generate_ai(request: Request):
         generation_queue["session_id"] = session_id
         generation_queue["status"]     = "queued"
 
-        # Clear any stale MCP results so the UI does not show old data
+        # Clear any stale MCP results so the UI does not show old data.
+        # This is the single per-run reset boundary — both the visible store and
+        # the in-flight chunk buffer are cleared so a new generation starts clean
+        # and batches only accumulate within one run.
+        global _chunk_buffer
+        _chunk_buffer = []
         mcp_results_store["test_cases"] = []
         mcp_results_store["summary"]    = None
         mcp_results_store["timestamp"]  = None
@@ -890,8 +1000,14 @@ async def save_mcp_results(request: Request):
     report = validate_test_cases(raw_tcs, valid_req_ids=queued_req_ids or None)
     _last_validation_report.update(report.summary())
     validated_tcs = report.valid_test_cases
+    # Accumulate across saves (see save_finalise) instead of overwriting.
+    validated_tcs = _merge_test_cases(mcp_results_store.get("test_cases"), validated_tcs)
+    _mcp_summary = dict(data.get("summary", {}) or {})
+    cov = _coverage(queued_req_ids, validated_tcs)
+    _mcp_summary["requirements_total"]   = cov["requirements_total"]
+    _mcp_summary["requirements_covered"] = cov["requirements_covered"]
     mcp_results_store["test_cases"] = validated_tcs
-    mcp_results_store["summary"]    = data.get("summary", {})
+    mcp_results_store["summary"]    = _mcp_summary
     mcp_results_store["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     generation_queue["status"]      = "complete"
     logger.info(
@@ -950,9 +1066,19 @@ async def save_finalise():
         )
     # ─────────────────────────────────────────────────────────────────────
 
+    # Accumulate across batches: merge this finalised batch into whatever is
+    # already stored for this run rather than overwriting it. This makes the
+    # merge independent of how the generator flags is_partial — every batch
+    # that reaches the backend is retained. The store is reset once per run
+    # in /api/generate/ai, which is the real "new generation" boundary.
+    test_cases = _merge_test_cases(mcp_results_store.get("test_cases"), test_cases)
+
+    cov = _coverage(queued_req_ids, test_cases)
     summary = {
         "total":               len(test_cases),
         "duplicates_removed":  0,
+        "requirements_total":   cov["requirements_total"],
+        "requirements_covered": cov["requirements_covered"],
         "by_module":           dict(Counter(tc.get("module", "General")            for tc in test_cases)),
         "by_requirement_type": dict(Counter(tc.get("requirement_type", "functional") for tc in test_cases)),
         "by_scenario_type":    dict(Counter(tc.get("scenario_type", "normal")        for tc in test_cases)),

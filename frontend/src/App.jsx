@@ -93,7 +93,10 @@ function DropZone({ label, required, file, loading, error, onFile, onClear }) {
 // ─── Page: Upload ─────────────────────────────────────────────────────────────
 
 function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefixes, onReqPrefixesChange }) {
-  const srsReady = !!files.srs
+  const srsReady    = !!files.srs
+  // REQ prefix is valid only if it resolves to at least one non-empty token
+  const prefixReady = reqPrefixes.split(',').map(p => p.trim()).filter(Boolean).length > 0
+  const canProceed  = srsReady && prefixReady
   return (
     <div className="max-w-3xl mx-auto px-6 py-8">
       <div className="mb-8">
@@ -219,9 +222,10 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
       </div>
 
       <div className="mt-8 flex justify-end">
-        <button onClick={onNext} disabled={!srsReady}
+        <button onClick={onNext} disabled={!canProceed}
+          title={!canProceed ? 'Upload an SRS document and enter a Requirement ID prefix to continue' : ''}
           className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center gap-2
-            ${srsReady
+            ${canProceed
               ? 'bg-amber hover:bg-amber/90 text-bg shadow-sm shadow-amber/20 cursor-pointer'
               : 'bg-border text-dim cursor-not-allowed'}`}>
           Next: Configure →
@@ -553,7 +557,10 @@ function PageExport({ testCases, summary, sessionId, exportSource }) {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
               {[
                 { label: 'Total test cases', value: summary.total },
-                { label: 'Requirements covered', value: new Set((testCases || []).map(tc => tc.traceability_req_id).filter(Boolean)).size },
+                { label: 'Requirements covered',
+                  value: (summary.requirements_total ?? 0) > 0
+                    ? `${summary.requirements_covered ?? 0} / ${summary.requirements_total}`
+                    : new Set((testCases || []).map(tc => tc.traceability_req_id).filter(Boolean)).size },
                 { label: 'Duplicates removed', value: dupCount, red: dupCount > 0 },
                 { label: 'Scenario types', value: Object.keys(summary.by_scenario_type || {}).length },
               ].map(s => (
@@ -625,7 +632,7 @@ export default function App() {
 
   // Config
   const [reqPrefixes,     setReqPrefixes]     = useState('')
-  const [scopeConfig,     setScopeConfig]     = useState({ selectedReqIds: null, selectedModule: null })
+  const [scopeConfig,     setScopeConfig]     = useState({ selectedReqIds: null, selectedModule: null, selectedModules: null })
   const [reviewPoints,    setReviewPoints]    = useState(DEFAULT_RP)
   const [customReviewPoints, setCustomReviewPoints] = useState([])
 
@@ -739,6 +746,7 @@ export default function App() {
           supporting_session_id: uploadData.supporting_session_id || null,
           selected_req_ids:      scopeConfig.selectedReqIds || null,
           selected_module:       scopeConfig.selectedModule  || null,
+          selected_modules:      scopeConfig.selectedModules || null,
           req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
         }),
       })

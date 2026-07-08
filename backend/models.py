@@ -72,6 +72,7 @@ class GenerateRequest(BaseModel):
     # Scope filters — None means generate for all
     selected_req_ids: Optional[List[str]] = None
     selected_module:  Optional[str]       = None
+    selected_modules: Optional[List[str]]  = None
     req_prefixes:     Optional[List[str]] = None
 
 
@@ -83,6 +84,9 @@ class GenerateSummary(BaseModel):
     by_testing_type: Dict[str, int]
     by_priority: Dict[str, int]
     duplicates_removed: int
+    # Coverage against the in-scope SRS requirement set
+    requirements_total: int = 0
+    requirements_covered: int = 0
 
 
 class GenerateResponse(BaseModel):

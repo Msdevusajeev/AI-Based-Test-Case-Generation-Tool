@@ -8,11 +8,12 @@ import { useState, useEffect } from 'react'
  */
 
 // ─── Module-level scope store — lives outside React, always up-to-date ───────
-export const _scope = { selectedReqIds: null, selectedModule: null }
+export const _scope = { selectedReqIds: null, selectedModule: null, selectedModules: null }
 
 function setScope(cfg) {
-  _scope.selectedReqIds = cfg.selectedReqIds
+  _scope.selectedReqIds  = cfg.selectedReqIds
   _scope.selectedModule  = cfg.selectedModule
+  _scope.selectedModules = cfg.selectedModules || null
   console.log('[SCOPE] _scope updated →', JSON.stringify(_scope))
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
   const [modules,   setModules]   = useState([])
   const [selected,  setSelected]  = useState([])
   const [selModule, setSelModule] = useState('')
+  const [selModules, setSelModules] = useState([])
   const [loading,   setLoading]   = useState(true)
   const [err,       setErr]       = useState('')
 
@@ -42,7 +44,8 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
         const mods = d.modules         || []
         setReqIds(ids); setModules(mods)
         setSelected([...ids]); setSelModule(mods[0] || '')
-        emit({ selectedReqIds: null, selectedModule: null })
+        setSelModules(mods.length > 0 ? [mods[0]] : [])
+        emit({ selectedReqIds: null, selectedModule: null, selectedModules: null })
       })
       .catch(e => setErr(e.message))
       .finally(() => setLoading(false))
@@ -56,8 +59,8 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
       const isAll = selected.length === reqIds.length
       emit({ selectedReqIds: isAll ? null : [...selected], selectedModule: null })
     } else if (t === 'module') {
-      const mod = selModule || modules[0] || null
-      emit({ selectedReqIds: null, selectedModule: mod })
+      const mods = selModules.length > 0 ? selModules : (modules.length > 0 ? [modules[0]] : [])
+      emit({ selectedReqIds: null, selectedModule: mods[0] || null, selectedModules: mods })
     }
   }
 
@@ -77,9 +80,19 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
     emit({ selectedReqIds: isAll ? null : next, selectedModule: null })
   }
 
-  const changeModule = (mod) => {
-    setSelModule(mod)
-    emit({ selectedReqIds: null, selectedModule: mod || null })
+  const toggleModule = (mod) => {
+    setSelModules(prev => {
+      const next = prev.includes(mod) ? prev.filter(m => m !== mod) : [...prev, mod]
+      const mods = next.length > 0 ? next : prev  // prevent empty selection
+      emit({ selectedReqIds: null, selectedModule: mods[0] || null, selectedModules: mods })
+      return mods
+    })
+  }
+
+  const toggleAllModules = () => {
+    const next = selModules.length === modules.length ? [modules[0]] : [...modules]
+    setSelModules(next)
+    emit({ selectedReqIds: null, selectedModule: next[0] || null, selectedModules: next })
   }
 
   if (loading) return (
@@ -152,16 +165,37 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
           {modules.length === 0 ? (
             <p className="text-xs text-dim">No modules detected</p>
           ) : (
-            <select value={selModule} onChange={e => changeModule(e.target.value)}
-              className="w-full bg-card border border-border text-text text-xs rounded-lg
-                px-2.5 py-2 focus:outline-none focus:border-amber/50 cursor-pointer">
-              {modules.map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
-          )}
-          {selModule && (
-            <p className="text-[10px] text-dim mt-2">
-              Only <span className="text-amber">"{selModule}"</span> requirements will be processed
-            </p>
+            <>
+              <div className="flex items-center justify-between mb-2">
+                <button onClick={toggleAllModules}
+                  className="text-[11px] text-amber/80 underline cursor-pointer">
+                  {selModules.length === modules.length ? 'Deselect all' : 'Select all'}
+                </button>
+                <span className="text-[10px] text-dim font-mono">{selModules.length}/{modules.length}</span>
+              </div>
+              <div className="space-y-1 max-h-[140px] overflow-y-auto pr-1">
+                {modules.map(mod => (
+                  <label key={mod} onClick={() => toggleModule(mod)}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded-lg border cursor-pointer
+                      transition-all select-none
+                      ${selModules.includes(mod)
+                        ? 'border-amber/30 bg-amber/8 text-amber'
+                        : 'border-border text-dim hover:border-amber/20'}`}>
+                    <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center
+                      flex-shrink-0 transition-all
+                      ${selModules.includes(mod) ? 'bg-amber border-amber' : 'bg-transparent border-border'}`}>
+                      {selModules.includes(mod) && <span className="text-bg text-[8px] font-bold">✓</span>}
+                    </div>
+                    <span className="text-[11px] truncate">{mod}</span>
+                  </label>
+                ))}
+              </div>
+              <p className="text-[10px] text-dim mt-2">
+                {selModules.length === 1
+                  ? <>Only <span className="text-amber">"{selModules[0]}"</span> requirements will be processed</>
+                  : <>{selModules.length} modules selected will be processed</>}
+              </p>
+            </>
           )}
         </>
       )}
