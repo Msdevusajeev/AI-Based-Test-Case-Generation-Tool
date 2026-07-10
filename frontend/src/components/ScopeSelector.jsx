@@ -22,7 +22,9 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
   const [tab,       setTab]       = useState('all')
   const [reqIds,    setReqIds]    = useState([])
   const [modules,   setModules]   = useState([])
-  const [selected,  setSelected]  = useState([])
+  const [selected,     setSelected]     = useState([])
+  const [reqIdEntries, setReqIdEntries] = useState([])
+  const [dupCount,     setDupCount]     = useState(0)
   const [selModule, setSelModule] = useState('')
   const [selModules, setSelModules] = useState([])
   const [loading,   setLoading]   = useState(true)
@@ -42,9 +44,12 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
       .then(d => {
         const ids  = d.requirement_ids || []
         const mods = d.modules         || []
+        const entries = d.req_id_entries || ids.map(id => ({ id, count: 1, duplicate: false }))
         setReqIds(ids); setModules(mods)
+        setReqIdEntries(entries)
+        setDupCount(d.duplicate_count || 0)
         setSelected([...ids]); setSelModule(mods[0] || '')
-        setSelModules(mods.length > 0 ? [mods[0]] : [])
+        setSelModules([...mods])  // default: all modules selected
         emit({ selectedReqIds: null, selectedModule: null, selectedModules: null })
       })
       .catch(e => setErr(e.message))
@@ -59,7 +64,9 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
       const isAll = selected.length === reqIds.length
       emit({ selectedReqIds: isAll ? null : [...selected], selectedModule: null })
     } else if (t === 'module') {
-      const mods = selModules.length > 0 ? selModules : (modules.length > 0 ? [modules[0]] : [])
+      // Keep current selModules selection — do not reset on tab switch
+      const mods = selModules.length > 0 ? selModules : (modules.length > 0 ? [...modules] : [])
+      if (selModules.length === 0 && modules.length > 0) setSelModules([...modules])
       emit({ selectedReqIds: null, selectedModule: mods[0] || null, selectedModules: mods })
     }
   }
@@ -130,6 +137,16 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
 
       {tab === 'reqs' && (
         <>
+          {dupCount > 0 && (
+            <div className="mb-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/30">
+              <p className="text-[11px] text-red-400 font-medium">
+                ⚠ {dupCount} duplicate requirement ID{dupCount > 1 ? 's' : ''} detected
+              </p>
+              <p className="text-[10px] text-dim mt-0.5">
+                IDs marked with × appear more than once in the document
+              </p>
+            </div>
+          )}
           <div className="flex items-center justify-between mb-2">
             <button onClick={toggleAll}
               className="text-[11px] text-amber/80 underline cursor-pointer">
@@ -141,21 +158,35 @@ export default function ScopeSelector({ sessionId, onChange, reqPrefixes }) {
             <p className="text-[10px] text-red-400 mb-2">⚠ Select at least one requirement</p>
           )}
           <div className="space-y-1 max-h-[140px] overflow-y-auto pr-1">
-            {reqIds.map(rid => (
-              <label key={rid} onClick={() => toggleReq(rid)}
+            {reqIdEntries.map((entry, idx) => {
+              const rid = entry.id
+              const isDup = entry.duplicate
+              return (
+              <label key={`${rid}-${idx}`} onClick={() => toggleReq(rid)}
                 className={`flex items-center gap-2 px-2 py-1.5 rounded-lg border cursor-pointer
                   transition-all select-none
-                  ${selected.includes(rid)
-                    ? 'border-amber/30 bg-amber/8 text-amber'
-                    : 'border-border text-dim hover:border-amber/20'}`}>
+                  ${isDup
+                    ? selected.includes(rid)
+                      ? 'border-red-400/50 bg-red-400/10 text-red-300'
+                      : 'border-red-400/30 text-red-400/70 hover:border-red-400/50'
+                    : selected.includes(rid)
+                      ? 'border-amber/30 bg-amber/8 text-amber'
+                      : 'border-border text-dim hover:border-amber/20'
+                  }`}>
                 <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center
                   flex-shrink-0 transition-all
                   ${selected.includes(rid) ? 'bg-amber border-amber' : 'bg-transparent border-border'}`}>
                   {selected.includes(rid) && <span className="text-bg text-[8px] font-bold">✓</span>}
                 </div>
                 <span className="text-[11px] font-mono truncate">{rid}</span>
+                {isDup && (
+                  <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-300 flex-shrink-0 font-medium"
+                    title={`This ID appears ${entry.count} times in the document`}>
+                    {entry.count}× duplicate
+                  </span>
+                )}
               </label>
-            ))}
+            )})}
           </div>
         </>
       )}

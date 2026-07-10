@@ -9,6 +9,7 @@ from constants import (
     PERFORMANCE_KEYWORDS, INTEGRATION_KEYWORDS, VALIDATION_ACTION_WORDS,
     BOUNDARY_TRIGGERS, STEP_TEMPLATES, INPUT_TEMPLATES,
     PRECONDITION_TEMPLATES, EXPECTED_OUTCOME_TEMPLATES,
+    BOOL_ENUM_TRIGGERS,
 )
 from config import DEDUP_THRESHOLD
 
@@ -277,7 +278,21 @@ def generate_remarks(sentence: str, req_id: str, notes_context: str = "",
 
     # Analysis observations
     if not any(k in lower for k in BOUNDARY_TRIGGERS):
-        items.append("Note: No explicit boundary values in SRS — define min/max constraints before execution")
+        # Req 5: min/max is a numeric-range concept. If the signal is
+        # Boolean/Enum (declared as such, or phrased with discrete-state
+        # words), don't tell the reviewer to "define min/max constraints" —
+        # that's inapplicable and misleading for discrete-valued signals.
+        is_discrete = (
+            "enum" in notes_context.lower()
+            or any(k in lower for k in BOOL_ENUM_TRIGGERS)
+        )
+        if is_discrete:
+            items.append(
+                "Note: Discrete-valued (Boolean/Enum) signal — verify every "
+                "declared state is exercised; numeric min/max does not apply"
+            )
+        else:
+            items.append("Note: No explicit boundary values in SRS — define min/max constraints before execution")
 
     if any(k in lower for k in SECURITY_KEYWORDS):
         items.append("Security: PII/security risk — ensure data masking in test environment")
@@ -1209,6 +1224,183 @@ def _generate_mcdc_tcs(
     return results, sc_counter
 
 
+# ─── THRESHOLD-BASED BVA / ECP / NOMINAL GENERATION ───────────────────────────
+# When a requirement expresses a numeric threshold condition (e.g. "Engine
+# Speed is less than or equal to 124"), the mandatory Boundary Value Analysis,
+# Equivalence Class Partitioning, and Nominal Value scenarios must be
+# generated for that parameter, formatted per its data type:
+#   Integer → whole-number steps (threshold, threshold-1, threshold+1, ...)
+#   Float   → six-decimal-place values (threshold, threshold-0.000001,
+#             threshold+0.1, ...)
+
+_THRESHOLD_WORD_OPS = [
+    (r'less\s+than\s+or\s+equal\s+to', '<='),
+    (r'greater\s+than\s+or\s+equal\s+to', '>='),
+    (r'no\s+more\s+than', '<='),
+    (r'no\s+less\s+than', '>='),
+    (r'at\s+most', '<='),
+    (r'at\s+least', '>='),
+    (r'less\s+than', '<'),
+    (r'greater\s+than', '>'),
+]
+
+# Parameter/signal names in SRS text are Title-Case, one to four words
+# (e.g. "Engine Speed", "Radio Altitude"). Requiring every word to start
+# with a capital letter — rather than allowing arbitrary lowercase text —
+# keeps the match from swallowing preceding words like "System shall
+# ensure" or sentence-initial "The".
+_SIGNAL_NAME = r'[A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*){0,3}'
+
+_THRESHOLD_WORD_PATTERN = re.compile(
+    r'\b(' + _SIGNAL_NAME + r')\s+is\s+(' +
+    '|'.join(pat for pat, _ in _THRESHOLD_WORD_OPS) +
+    r')\s+(-?\d+(?:\.\d+)?)'
+)
+
+_THRESHOLD_SYMBOL_PATTERN = re.compile(
+    r'\b(' + _SIGNAL_NAME + r')\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)'
+)
+
+# Common sentence-initial words that can accidentally match the Title-Case
+# signal-name pattern (capitalised only because they start the sentence).
+_LEADING_STOPWORDS = {
+    "the", "a", "an", "if", "when", "system", "this", "that", "these",
+    "those", "otherwise", "then",
+}
+
+
+def _clean_signal_name(name: str) -> str:
+    """Strips a leading stopword that was only captured because it began
+    the sentence (e.g. 'The Engine Speed' -> 'Engine Speed')."""
+    words = name.split()
+    while len(words) > 1 and words[0].lower() in _LEADING_STOPWORDS:
+        words = words[1:]
+    return " ".join(words)
+
+
+def _detect_threshold_condition(sentence: str, full_content: str) -> dict:
+    """
+    Detects a numeric threshold comparison ("Engine Speed is less than or
+    equal to 124", "Engine Speed <= 124", ...) and resolves the parameter's
+    data type and valid range from ICD-style range data in full_content
+    (e.g. "Engine Speed | Integer | 0 to 350"), falling back to sensible
+    defaults when that data is not present. Returns None if no threshold
+    condition is found.
+    """
+    name = op = threshold_str = None
+
+    m = _THRESHOLD_WORD_PATTERN.search(sentence)
+    if m:
+        name = m.group(1).strip()
+        phrase = m.group(2).strip()
+        for pat, sym in _THRESHOLD_WORD_OPS:
+            if re.fullmatch(pat, phrase, re.IGNORECASE):
+                op = sym
+                break
+        threshold_str = m.group(3)
+    else:
+        m = _THRESHOLD_SYMBOL_PATTERN.search(sentence)
+        if m:
+            name = m.group(1).strip()
+            op = m.group(2)
+            threshold_str = m.group(3)
+
+    if not name or not op or threshold_str is None:
+        return None
+
+    name = _clean_signal_name(name)
+
+    # Resolve data type + valid range from ICD-style "Name | Type | Lo to Hi"
+    data_type = "Float" if "." in threshold_str else "Integer"
+    range_lo = range_hi = None
+    range_m = re.search(
+        rf'{re.escape(name)}\s*\|\s*(\w+)\s*\|\s*([-\d.]+)\s+to\s+([-\d.]+)',
+        full_content, re.IGNORECASE
+    )
+    if range_m:
+        declared_type = range_m.group(1).strip().lower()
+        if declared_type.startswith(("float", "real", "double")):
+            data_type = "Float"
+        elif declared_type.startswith("int"):
+            data_type = "Integer"
+        range_lo = float(range_m.group(2))
+        range_hi = float(range_m.group(3))
+
+    return {
+        "name": name,
+        "operator": op,
+        "threshold": float(threshold_str),
+        "data_type": data_type,
+        "range_lo": range_lo,
+        "range_hi": range_hi,
+    }
+
+
+def _fmt_threshold_value(value: float, data_type: str) -> str:
+    if data_type == "Float":
+        return f"{value:.6f}"
+    return str(int(round(value)))
+
+
+def _threshold_condition_holds(value: float, operator: str, threshold: float) -> bool:
+    return {
+        "<=": value <= threshold,
+        ">=": value >= threshold,
+        "<":  value < threshold,
+        ">":  value > threshold,
+    }[operator]
+
+
+def _threshold_scenarios(info: dict) -> List[dict]:
+    """
+    Returns the mandatory boundary/ECP/min/max/nominal scenarios for a
+    detected threshold condition. Each item is a dict with:
+      label, value (raw float), formatted (per data type), note
+    The last item is always the Nominal Value case.
+    """
+    dt = info["data_type"]
+    threshold = info["threshold"]
+    lo = info["range_lo"] if info["range_lo"] is not None else 0.0
+    hi = info["range_hi"]
+
+    if dt == "Float":
+        ecp_minus = threshold - 0.000001
+        ecp_plus = threshold + 0.1
+    else:
+        ecp_minus = threshold - 1
+        ecp_plus = threshold + 1
+
+    scenarios = [
+        {"label": "Boundary Value", "value": threshold,
+         "note": "value sits exactly at the threshold"},
+        {"label": "Equivalence Class Partition -1", "value": ecp_minus,
+         "note": "one step inside the threshold (adjacent equivalence class)"},
+        {"label": "Equivalence Class Partition +1", "value": ecp_plus,
+         "note": "one step outside the threshold (adjacent equivalence class)"},
+        {"label": "Minimum Boundary Value", "value": lo,
+         "note": "minimum of the parameter's valid range"},
+    ]
+    if hi is not None:
+        scenarios.append({
+            "label": "Maximum Boundary Value", "value": hi,
+            "note": "maximum of the parameter's valid range",
+        })
+        nominal = threshold + (hi - threshold) / 2
+    else:
+        # No declared upper range — use a representative offset above the
+        # threshold as the typical mid-range operating value.
+        nominal = threshold + (10 if dt == "Integer" else 10.0)
+
+    scenarios.append({
+        "label": "Nominal Value", "value": nominal,
+        "note": "typical valid operating value, distinct from boundary/ECP cases",
+    })
+
+    for sc in scenarios:
+        sc["formatted"] = _fmt_threshold_value(sc["value"], dt)
+    return scenarios
+
+
 def generate_for_chunk(
     chunk: DocumentChunk,
     tc_counters: Dict[str, int],
@@ -1304,7 +1496,83 @@ def generate_for_chunk(
                                                "value is", "values are", "range", "between"]
         ) else "SRS"
 
+        # Threshold-based BVA/ECP/Nominal detection (mandatory scenarios when
+        # the requirement expresses a numeric threshold condition)
+        threshold_info = _detect_threshold_condition(sentence, raw_content)
+        threshold_scenarios = _threshold_scenarios(threshold_info) if threshold_info else None
+
         for scenario_type in scenario_types:
+            # ── Threshold-based boundary/ECP scenarios ────────────────────────
+            # Replace the single generic boundary TC with one TC per mandatory
+            # BVA/ECP/min/max case for this parameter's data type.
+            if scenario_type == "boundary" and threshold_scenarios:
+                param_name = threshold_info["name"]
+                op         = threshold_info["operator"]
+                thr_fmt    = _fmt_threshold_value(threshold_info["threshold"], threshold_info["data_type"])
+                action_fmt = action.replace("{", "{{").replace("}", "}}") if action else "perform operation"
+                subject_fmt = subject.replace("{", "{{").replace("}", "}}") if subject else "the system"
+
+                for case in threshold_scenarios:
+                    if case["label"] == "Nominal Value":
+                        continue   # nominal is folded into the 'normal' TC below
+
+                    tc_counters[prefix] += 1
+                    tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
+                    sc_id = f"SC_{sc_counter:03d}"
+
+                    priority    = assign_priority(chunk.requirement_type, "boundary", testing_type)
+                    methodology = assign_methodology(sentence, "boundary")
+                    holds       = _threshold_condition_holds(case["value"], op, threshold_info["threshold"])
+
+                    case_steps = [
+                        "1. Ensure all preconditions are satisfied",
+                        f"2. Set {param_name} to {case['formatted']} ({case['label']} — {case['note']})",
+                        f"3. Execute: {action_fmt}",
+                        "4. Observe system response",
+                        f"5. Verify the '{param_name} {op} {thr_fmt}' condition evaluates to "
+                        f"{'TRUE' if holds else 'FALSE'} at this value",
+                        "6. Confirm no data corruption or unexpected side effects occur",
+                    ]
+                    case_inputs = [f"{param_name}: {case['formatted']}"]
+                    case_preconditions = [
+                        t.format(module=chunk.module, subject=subject_fmt, env=env)
+                        for t in PRECONDITION_TEMPLATES["boundary"]
+                    ]
+                    case_expected = (
+                        f"{param_name} = {case['formatted']}. System correctly evaluates the "
+                        f"'{param_name} {op} {thr_fmt}' condition as "
+                        f"{'TRUE' if holds else 'FALSE'} and produces the corresponding output. "
+                        f"No data corruption occurs."
+                    )
+                    case_remarks = (
+                        generate_remarks(sentence, primary_req_id, notes_ctx, "boundary", input_source)
+                        if review_points.get("rp4", True)
+                        else "• Scenario (BOUNDARY): Verify before execution."
+                    )
+                    deps = resolve_dependencies("boundary", results, primary_req_id)
+
+                    results.append(TestCase(
+                        traceability_req_id  = primary_req_id,
+                        test_case_id         = tc_id,
+                        scenario_id          = sc_id,
+                        priority             = priority,
+                        objective            = f"[BOUNDARY] Verify {subject} {action} — "
+                                                f"{case['label']}: {param_name} = {case['formatted']}",
+                        preconditions        = case_preconditions,
+                        test_steps           = case_steps,
+                        inputs               = case_inputs,
+                        design_methodology   = methodology,
+                        dependent_test_cases = deps,
+                        expected_outcome     = case_expected,
+                        test_environment     = env,
+                        remarks              = case_remarks,
+                        module               = chunk.module,
+                        requirement_type     = chunk.requirement_type,
+                        scenario_type        = "boundary",
+                        testing_type         = testing_type,
+                    ))
+                continue   # skip the generic single-boundary-TC path below
+
             tc_counters[prefix] += 1
             tc_id = f"TC_{prefix}_{tc_counters[prefix]:03d}"
             sc_id = f"SC_{sc_counter:03d}"
@@ -1333,6 +1601,15 @@ def generate_for_chunk(
                 t.format(subject=subject_fmt)
                 for t in INPUT_TEMPLATES[scenario_type]
             ]
+
+            # Nominal Value Testing (Req: threshold-based mandatory scenarios)
+            # Fold the concrete Nominal value into the generic 'normal' TC so
+            # each requirement keeps exactly one normal-path TC.
+            if scenario_type == "normal" and threshold_scenarios:
+                nominal_case = next(c for c in threshold_scenarios if c["label"] == "Nominal Value")
+                inputs = [
+                    f"{threshold_info['name']}: {nominal_case['formatted']} (Nominal Value)"
+                ] + inputs
 
             # Build preconditions with pre-set input info (Req 9)
             preconditions = [

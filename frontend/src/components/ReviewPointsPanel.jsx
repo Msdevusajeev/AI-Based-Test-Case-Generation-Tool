@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
 
-const REVIEW_POINTS = [
+// Exported so other consumers (e.g. the Claude AI prompt builder in App.jsx)
+// can render the exact same checklist text shown here — single source of truth.
+export const REVIEW_POINTS = [
   {
     id: 'rp1',
     label: 'Segregate by Module & Requirement Type',
@@ -22,6 +24,18 @@ const REVIEW_POINTS = [
     desc: 'Auto-detect risks, PCI concerns, and missing specs',
   },
 ]
+
+// Rendered separately in the UI (distinct red "destructive" styling) but it's
+// still a review-checklist item, so it's exported alongside REVIEW_POINTS for
+// prompt-building purposes.
+export const DEDUPE_REVIEW_POINT = {
+  id: 'rp5',
+  label: 'Remove duplicate test cases',
+  desc: 'Removes near-identical TCs after generation (similarity >= 0.85)',
+}
+
+// Convenience: every checklist item in stable display order, built-ins first.
+export const ALL_REVIEW_POINTS = [...REVIEW_POINTS, DEDUPE_REVIEW_POINT]
 
 export default function ReviewPointsPanel({
   reviewPoints, onChange, disabled,

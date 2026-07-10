@@ -213,6 +213,8 @@ def _build_required_scenarios(req_id: str, content: str,
     Returns a list of scenario stubs with scenario_type, scenario_id, and
     a hint for the input values — Claude fills in all remaining fields.
     """
+    import re
+
     try:
         from test_case_generator import _parse_conditional_requirement
         parsed = _parse_conditional_requirement(content)
@@ -231,6 +233,48 @@ def _build_required_scenarios(req_id: str, content: str,
     def sid():
         nonlocal sc
         s = f"SC_{sc:03d}"; sc += 1; return s
+
+    def _garbage_value_for(cond: dict) -> str:
+        """
+        Req 4: never hand Claude the literal placeholder '<invalid/
+        out-of-range value>' — resolve a concrete invalid/garbage value for
+        this specific condition instead.
+          - Numeric condition with an ICD range: flip_val IS already a real
+            number just outside the valid range — use it directly.
+          - Enum condition: a token that is provably outside the declared
+            valid set.
+          - Boolean condition: a value outside {True, False}.
+          - Otherwise: a clearly-labelled malformed-data marker naming the
+            signal, so the reviewer knows exactly what garbage to inject.
+        """
+        flip = str(cond.get("flip_val", "")).strip()
+        try:
+            float(flip)
+            return flip  # genuine ICD-derived out-of-range number
+        except (TypeError, ValueError):
+            pass
+        enum_vals = cond.get("enum_values") or []
+        if enum_vals:
+            return f"INVALID_ENUM_CODE (not one of: {', '.join(enum_vals)})"
+        if str(cond.get("required_val", "")).strip().lower() in (
+            "true", "false", "1", "0", "yes", "no", "enabled", "disabled"
+        ):
+            return "2 (undefined boolean state)"
+        return f"CORRUPTED_{cond['name'].upper().replace(' ', '_')}_DATA"
+
+    def _unavailable_label(cond: dict) -> str:
+        """
+        Req 6: use the SRS-declared enum token for the 'unavailable' /
+        'no data' state (e.g. 'Not_Available') instead of hardcoding the
+        generic word 'Unavailable', which may not match what's actually
+        declared in the requirement's Notes.
+        """
+        for v in cond.get("enum_values", []) or []:
+            if re.sub(r"[\s_-]", "", v).lower() in (
+                "notavailable", "unavailable", "nodata", "nocompute", "ncd", "invaliddata"
+            ):
+                return v
+        return "Unavailable"
 
     # ── 1. NORMAL — all conditions at required value ──────────────────────────
     normal_inputs = [f"{c['name']}: {c['required_val']}" for c in conditions]
@@ -299,7 +343,7 @@ def _build_required_scenarios(req_id: str, content: str,
     scenarios.append({
         "scenario_id":   sid(),
         "scenario_type": "robustness",
-        "hint_inputs":   [f"{conditions[0]['name']}: <invalid/out-of-range value>"] if conditions else ["Input: invalid value"],
+        "hint_inputs":   [f"{conditions[0]['name']}: {_garbage_value_for(conditions[0])}"] if conditions else ["Input: 0xFFFF (undefined/corrupted value)"],
         "hint_outcome":  f"{output_name} = {output_false} (system handles invalid input gracefully)",
         "hint_objective": "Verify system remains stable and output is safe when an input receives an invalid/out-of-range value",
     })
@@ -308,7 +352,7 @@ def _build_required_scenarios(req_id: str, content: str,
     scenarios.append({
         "scenario_id":   sid(),
         "scenario_type": "robustness",
-        "hint_inputs":   [f"{c['name']}: Unavailable" for c in (conditions[:2] if conditions else [{"name": "Input signal"}])],
+        "hint_inputs":   [f"{c['name']}: {_unavailable_label(c)}" for c in (conditions[:2] if conditions else [{"name": "Input signal", "enum_values": []}])],
         "hint_outcome":  f"{output_name} = {output_false} (safe state on signal loss)",
         "hint_objective": "Verify system enters safe state when input signals become unavailable or communication is lost",
     })
@@ -322,26 +366,26 @@ def _build_required_scenarios(req_id: str, content: str,
         "hint_objective": f"Verify {output_name} recovers to {output_true} after invalid inputs return to valid range",
     })
 
-    # ── 9. TRANSITION — inactive → active ────────────────────────────────────
+    # ── 9. TRANSITION — inactive -> active ────────────────────────────────────
     scenarios.append({
         "scenario_id":   sid(),
         "scenario_type": "transition",
         "hint_inputs":   (
-            [f"{conditions[0]['name']}: {conditions[0]['flip_val']} → {conditions[0]['required_val']}"]
+            [f"{conditions[0]['name']}: {conditions[0]['flip_val']} -> {conditions[0]['required_val']}"]
             + [f"{c['name']}: {c['required_val']}" for c in conditions[1:]]
-        ) if conditions else ["State: Inactive → Active"],
+        ) if conditions else ["State: Inactive -> Active"],
         "hint_outcome":  f"{output_name} transitions from {output_false} to {output_true}",
         "hint_objective": f"Verify {output_name} activates correctly as conditions transition from inactive to active state",
     })
 
-    # ── 10. TRANSITION — active → inactive ───────────────────────────────────
+    # ── 10. TRANSITION — active -> inactive ───────────────────────────────────
     scenarios.append({
         "scenario_id":   sid(),
         "scenario_type": "transition",
         "hint_inputs":   (
-            [f"{conditions[0]['name']}: {conditions[0]['required_val']} → {conditions[0]['flip_val']}"]
+            [f"{conditions[0]['name']}: {conditions[0]['required_val']} -> {conditions[0]['flip_val']}"]
             + [f"{c['name']}: {c['required_val']}" for c in conditions[1:]]
-        ) if conditions else ["State: Active → Inactive"],
+        ) if conditions else ["State: Active -> Inactive"],
         "hint_outcome":  f"{output_name} transitions from {output_true} to {output_false}",
         "hint_objective": f"Verify {output_name} deactivates correctly when a condition transitions from active to inactive",
     })
@@ -359,6 +403,31 @@ def _build_required_scenarios(req_id: str, content: str,
             "hint_outcome":  f"{output_name} = {output_false} (partial activation not sufficient)",
             "hint_objective": "Verify output remains inactive when only a subset of AND conditions are met during activation sequence",
         })
+
+    # ── 12. EDGE — full enumeration coverage for 3+ value Enum conditions ────
+    # Req 6: MC/DC only needs required_val + flip_val (2 states). If the SRS
+    # declares a 3rd (or more) valid Enum value — e.g. Valid / Invalid /
+    # Not_Available — it's covered here so no declared state is ever skipped.
+    for cond in conditions:
+        enum_vals = cond.get("enum_values") or []
+        if len(enum_vals) <= 2:
+            continue
+        covered = {str(cond["required_val"]).lower(), str(cond["flip_val"]).lower()}
+        for extra_val in enum_vals:
+            if extra_val.lower() in covered:
+                continue
+            covered.add(extra_val.lower())
+            extra_inputs = [
+                f"{c['name']}: {extra_val}" if c["name"] == cond["name"] else f"{c['name']}: {c['required_val']}"
+                for c in conditions
+            ]
+            scenarios.append({
+                "scenario_id":   sid(),
+                "scenario_type": "edge",
+                "hint_inputs":   extra_inputs,
+                "hint_outcome":  f"{output_name} = {output_false} ({cond['name']} = {extra_val} is not a required-activation value)",
+                "hint_objective": f"Verify {output_name} behaviour when {cond['name']} is set to its declared '{extra_val}' state (full Enum coverage)",
+            })
 
     return scenarios
 

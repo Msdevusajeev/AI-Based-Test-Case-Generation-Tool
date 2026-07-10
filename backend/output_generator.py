@@ -29,6 +29,7 @@ Exact column layout (matches template):
 
 import io
 import re
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Tuple
 
@@ -107,14 +108,62 @@ _OUTPUT_STARTER_SKIP = {
 }
 
 
+_TRANSITION_PHRASE = re.compile(
+    r'(?:transition(?:s|ing)?\s+from\s+)?'
+    r'([A-Za-z][\w]{0,20}(?:\s+[A-Za-z][\w]{0,20}){0,2})'
+    r'\s+to\s+'
+    r'([A-Za-z][\w]{0,20}(?:\s+[A-Za-z][\w]{0,20}){0,2})'
+    r'\s*$',
+    re.IGNORECASE,
+)
+# Left-side words that mean "assign to X", not "from state X" — guards
+# against misreading values like "Set to True" as a state transition.
+_TRANSITION_LEFT_STOPWORDS = {
+    "set", "reset", "change", "changed", "switch", "switched",
+    "move", "moved", "go", "goes", "went", "assign", "assigned",
+}
+
+
+def _normalize_transition_value(value: str) -> str:
+    """
+    Req 2: represent state transitions with arrow notation
+    ('Invalid -> Valid') instead of prose ('transition from Invalid to
+    Valid'). Only rewrites values that name two short discrete states —
+    a numeric phrase like '10 to 50' is left untouched because both
+    captured groups must start with a letter, and assignment phrasing
+    like 'Set to True' is left untouched too.
+    """
+    if not value or " to " not in value.lower():
+        return value
+    m = _TRANSITION_PHRASE.search(value.strip())
+    if not m:
+        return value
+    left, right = m.group(1).strip(), m.group(2).strip()
+    if left.split()[-1].lower() in _TRANSITION_LEFT_STOPWORDS:
+        return value
+    return f"{left} -> {right}"
+
+
 def _parse_signal_value(entry: str) -> Tuple[str, str]:
     """Parses 'Name: Value' or 'Name = Value' into (name, value)."""
     s = entry.strip()
     # Prefer colon separator (standard format), fall back to equals
     m = _KV_COLON.match(s) or _KV_EQUAL.match(s)
     if m:
-        return m.group(1).strip(), m.group(2).strip()
+        return m.group(1).strip(), _normalize_transition_value(m.group(2).strip())
     return s, ""
+
+
+def _has_numeric_inputs(tc: TestCase) -> bool:
+    """True if at least one input value is numeric — used to decide whether
+    min/max language is applicable (Req 5: it isn't, for pure Boolean/Enum
+    inputs)."""
+    for entry in tc.inputs:
+        _, value = _parse_signal_value(entry)
+        v = (value or "").strip().lstrip("+-")
+        if v.replace(".", "", 1).isdigit():
+            return True
+    return False
 
 
 def _is_valid_input_signal(entry: str, is_signal_tc: bool) -> bool:
@@ -505,56 +554,102 @@ def _sc_label(sc_no: int) -> str:
 #   • Test Objective (from col D/E)
 #   • Test Steps that are related to the identified input parameter names (from H, I... cols)
 
+def _description_signal_names(tc: TestCase, limit: int = 2) -> str:
+    """Pulls 1-2 real input signal names from this TC for a context-specific
+    description, instead of a generic phrase."""
+    names = []
+    for entry in tc.inputs:
+        name, _ = _parse_signal_value(entry)
+        if name and name.lower() not in ("test environment", "all prerequisite", "sub-requirements"):
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return " and ".join(names) if names else "the input conditions"
+
+
+def _description_output_name(tc: TestCase) -> str:
+    """Pulls the real output signal name from expected_outcome when available."""
+    name, _ = _extract_output_signal(tc.expected_outcome)
+    return name if name else "the system output"
+
+
+def _description_variant_index(tc: TestCase, modulo: int) -> int:
+    """
+    Deterministic (not random) variant picker: the same TC always renders
+    the same phrasing on regeneration, but different requirements/scenarios
+    land on different variants — avoiding repetitive, template-identical
+    descriptions across the sheet (Req 3).
+    """
+    if modulo <= 1:
+        return 0
+    key = f"{tc.traceability_req_id}|{tc.scenario_id}|{tc.scenario_type}"
+    return int(hashlib.md5(key.encode()).hexdigest(), 16) % modulo
+
+
 def _col_e_test_details(tc: TestCase) -> str:
     """
     Column E — Test Details Description.
-    A narrative explanation of what this test does and why — scenario-type driven.
-    Does NOT repeat inputs, expected output, preconditions, or objective.
+    A narrative, requirement-specific explanation of what this test does and
+    why — scenario-type driven, but phrased with the real signal/output names
+    and varied sentence structure so it isn't identical across every TC of
+    the same scenario type (Req 3).
+    Does NOT repeat inputs, expected output, preconditions, or the test
+    objective, and does NOT restate Design Methodology / Module, since those
+    already have their own dedicated columns (Req 1).
     """
-    _DETAIL_MAP = {
-        "normal": (
-            "Verifies the primary activation path. All input conditions are set to their "
-            "nominal required values simultaneously to confirm the system output activates "
-            "as specified. This scenario also serves as the baseline reference for all "
-            "MC/DC independence pair tests."
-        ),
-        "boundary": (
-            "Verifies MC/DC independence by varying exactly one input condition at a time "
-            "while holding all other conditions at their required values. Confirms the "
-            "output state change is solely and independently controlled by the varied "
-            "condition, satisfying the MC/DC coverage criterion per DO-178C."
-        ),
-        "edge": (
-            "Verifies system behaviour when all input conditions are simultaneously "
-            "inactive, conflicting, or at non-activating values. Confirms the output "
-            "remains in its safe inactive state and the system correctly handles this "
-            "configuration without any unintended activation."
-        ),
-        "robustness": (
-            "Verifies system stability and fault tolerance when inputs receive invalid, "
-            "out-of-range, or unavailable values. Confirms the system does not crash, "
-            "produce undefined outputs, or enter an unsafe state. Also tests recovery "
-            "behaviour when inputs return to valid range."
-        ),
-        "transition": (
-            "Verifies correct state transition behaviour as the system moves between "
-            "active and inactive states. Confirms output activation and deactivation "
-            "sequences are correct, partial activation conditions are handled properly, "
-            "and state changes occur at the expected trigger points."
-        ),
+    sig = _description_signal_names(tc)
+    out = _description_output_name(tc)
+    req = tc.traceability_req_id or "the requirement"
+
+    _DETAIL_VARIANTS = {
+        "normal": [
+            f"Sets {sig} to their nominal, required values simultaneously and confirms "
+            f"{out} activates as {req} specifies. Also serves as the MC/DC baseline for "
+            f"the independence-pair tests derived from this decision.",
+            f"Drives the primary activation path for {req}: every condition at its correct "
+            f"operating value at once, checking that {out} responds exactly as intended.",
+            f"Establishes the reference 'all-conditions-met' case for {req}, against which "
+            f"the MC/DC flip tests for {sig} are later compared.",
+        ],
+        "boundary": [
+            f"Flips {sig} on its own while holding every other condition at its required "
+            f"value, confirming {out} changes solely because of that one variable — the "
+            f"MC/DC independence check for {req}.",
+            f"Isolates {sig} from the other conditions in {req} to prove it independently "
+            f"controls {out}, satisfying the MC/DC coverage objective for this decision.",
+            f"Tests whether {out} tracks a single-condition change in {sig} without being "
+            f"masked by any other input, per the MC/DC pairing required for {req}.",
+        ],
+        "edge": [
+            f"Puts {sig} at an inactive or non-triggering value at the same time as every "
+            f"other condition and confirms {out} stays safely inactive under {req}.",
+            f"Checks the fully de-energised corner case for {req}: all inputs simultaneously "
+            f"at non-activating values, with {out} expected to remain in its safe state.",
+            f"Exercises the combined worst-case configuration where none of {sig} meet the "
+            f"activation criteria, verifying {out} does not activate unintentionally.",
+        ],
+        "robustness": [
+            f"Feeds {sig} an invalid or out-of-range value and confirms the system tolerates "
+            f"it without crashing, corrupting {out}, or entering an undefined state.",
+            f"Checks fault tolerance for {req} by corrupting {sig}, then verifying the system "
+            f"degrades safely and {out} does not produce an undefined result.",
+            f"Verifies recovery behaviour: after {sig} receives a bad value, restoring it to "
+            f"a valid range should bring {out} back to its correct state.",
+        ],
+        "transition": [
+            f"Drives {sig} through the state change called out in {req} and confirms {out} "
+            f"activates or deactivates at the correct trigger point.",
+            f"Walks {sig} across the transition boundary defined in {req}, checking that "
+            f"{out} switches state exactly when it should — no early or delayed response.",
+            f"Confirms partial or sequenced changes in {sig} are handled correctly as the "
+            f"system moves between states, with {out} reflecting the right state at each step.",
+        ],
     }
 
-    sc_type = (tc.scenario_type or "").lower()
-    base    = _DETAIL_MAP.get(sc_type, "Verifies functional system behaviour as specified in the requirement.")
-
-    # Append methodology context if available
-    extra = []
-    if tc.design_methodology:
-        extra.append(f"Design methodology: {tc.design_methodology}.")
-    if tc.module:
-        extra.append(f"Module under test: {tc.module}.")
-
-    return (base + "\n" + "  ".join(extra)).strip() if extra else base
+    sc_type  = (tc.scenario_type or "").lower()
+    variants = _DETAIL_VARIANTS.get(sc_type, [f"Verifies the functional behaviour of {req} as specified."])
+    idx      = _description_variant_index(tc, len(variants))
+    return variants[idx]
 
 def _col_f_precondition(tc: TestCase, input_signals: List[str]) -> str:
     """
@@ -574,19 +669,22 @@ def _remarks_bullets(tc: TestCase) -> str:
     """
     Requirement 8:
     - Remove test-basis-related info
-    - Include type of testing per scenario
+    - Testing Type / Scenario Type are NOT repeated here — they already have
+      dedicated columns in the test case template, so including them in the
+      Remarks/Additional Information text would be redundant.
     - Describe what is tested in each SC (e.g. INPUT_1 maximum value is tested)
     - Bullet-point format
     """
     bullets = []
 
-    # Type of testing for this scenario
-    bullets.append(f"• Testing Type: {tc.testing_type.capitalize()} | Scenario Type: {tc.scenario_type.capitalize()}")
-
     # What is being tested (Req 8 — describe each SC)
+    if tc.scenario_type == "boundary" and not _has_numeric_inputs(tc):
+        boundary_what = "Each declared valid/invalid state of the input parameter(s) is exercised individually (no numeric min/max applies)."
+    else:
+        boundary_what = "Input boundary values tested: minimum, maximum, min-1, max+1 for each parameter."
     sc_what = {
         "normal":     "All input values set to normal/valid values; correct system output is verified.",
-        "boundary":   "Input boundary values tested: minimum, maximum, min-1, max+1 for each parameter.",
+        "boundary":   boundary_what,
         "edge":       "Edge case conditions tested (state transitions, simultaneous changes, unusual-but-valid states).",
         "robustness": "Invalid/out-of-range input values tested; system must respond safely without crash.",
     }

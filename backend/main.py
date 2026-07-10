@@ -461,18 +461,38 @@ def get_scope(session_id: str = Query(...), req_prefixes: str = Query(default=""
     seen_r:  set  = set()
     seen_m:  set  = set()
 
-    # Preserve document order — do NOT sort chunks or modules
+    # Count occurrences of each requirement ID to detect duplicates
+    from collections import Counter
+    rid_counts = Counter(
+        c.requirement_ids[0] for c in chunks if c.requirement_ids
+    )
+
+    # Preserve document order — include EVERY occurrence with plain ID
+    req_id_entries = []   # list of {id, count, duplicate} for frontend
     for c in chunks:
         rid = c.requirement_ids[0] if c.requirement_ids else None
-        if rid and rid not in seen_r:
-            seen_r.add(rid)
+        if rid:
+            total = rid_counts[rid]
+            # Always use the plain ID — frontend handles display
             req_ids.append(rid)
+            req_id_entries.append({
+                "id":        rid,
+                "count":     total,
+                "duplicate": total > 1,
+            })
         mod = c.module or "General"
         if mod not in seen_m:
             seen_m.add(mod)
             modules.append(mod)
 
-    return {"requirement_ids": req_ids, "modules": modules}
+    dup_entries = [e for e in req_id_entries if e["duplicate"]]
+    return {
+        "requirement_ids": req_ids,
+        "modules":         modules,
+        "req_id_entries":  req_id_entries,
+        "duplicate_count": len(set(e["id"] for e in dup_entries)),
+        "duplicates":      dup_entries,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -683,15 +703,44 @@ async def get_progress(session_id: str):
 
 # ── Open Claude Desktop endpoint ─────────────────────────────────────────────
 @app.post("/api/open-claude")
-async def open_claude():
+async def open_claude(request: Request):
     """
-    Brings Claude Desktop to front using PowerShell AppActivate.
-    Writes a temp PS1 script and runs it via powershell.exe directly
-    (not via cmd or schtasks) to preserve the interactive desktop context.
+    Brings Claude Desktop to front using PowerShell AppActivate, and pastes
+    the generated prompt into a new chat.
+
+    The prompt is written to a temp file and the clipboard is set by the
+    PowerShell script itself (Set-Clipboard) immediately before the paste —
+    NOT by the browser's navigator.clipboard.writeText. Relying on the browser
+    call left a race/silent-failure gap (focus-stealing on the click,
+    permissions-policy denial, etc. would fail the write with no visible
+    error, so ^v would paste stale or empty clipboard content even though the
+    window activation and keystrokes all "worked"). Setting the clipboard
+    inside the same synchronous script that does the paste removes that race
+    entirely.
     """
     import pathlib, tempfile, os
 
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    prompt_text = data.get("prompt", "") or ""
+
+    # Write the prompt to its own temp file — safer than trying to escape
+    # arbitrary prompt content (quotes, backticks, newlines) into a PS string.
+    prompt_file = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', delete=False, encoding='utf-8'
+    )
+    prompt_file.write(prompt_text)
+    prompt_file.close()
+    prompt_path = prompt_file.name
+
     ps_script = """
+# Set the clipboard from the prompt file FIRST, synchronously, so there is
+# no race with the paste below.
+$promptText = Get-Content -Raw -Encoding UTF8 -Path '__PROMPT_PATH__'
+if ($promptText) { Set-Clipboard -Value $promptText }
+
 $proc = Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -eq 'Claude'} | Select-Object -First 1
 if ($proc) {
     $wshell = New-Object -ComObject WScript.Shell
@@ -724,7 +773,9 @@ if ($proc) {
     Start-Sleep -Milliseconds 800
     $wshell2.SendKeys('~')
 }
-"""
+
+Remove-Item -Path '__PROMPT_PATH__' -ErrorAction SilentlyContinue
+""".replace('__PROMPT_PATH__', prompt_path)
 
     try:
         # Write PS1 to temp file
@@ -745,7 +796,7 @@ if ($proc) {
             ],
             shell=False
         )
-        logger.info(f"[OPEN-CLAUDE] PS1 launched: {tmp.name}")
+        logger.info(f"[OPEN-CLAUDE] PS1 launched: {tmp.name} | prompt_chars={len(prompt_text)}")
         return {"status": "launched", "method": "powershell_ps1"}
 
     except Exception as e:
@@ -796,9 +847,12 @@ async def generate_ai(request: Request):
         # ── DEBUG: store and log incoming payload ─────────────────────────
         _last_ai_request.clear()
         _last_ai_request.update({
-            "keys":        list(data.keys()),
-            "req_prefixes": data.get("req_prefixes"),
-            "session_id":  session_id,
+            "keys":                   list(data.keys()),
+            "req_prefixes":           data.get("req_prefixes"),
+            "session_id":             session_id,
+            "selected_module":        data.get("selected_module"),
+            "selected_modules_count": len(data.get("selected_modules") or []),
+            "selected_modules_sample":(data.get("selected_modules") or [])[:3],
         })
         logger.info(
             f"[AI-ENDPOINT] incoming keys={list(data.keys())} | "
@@ -992,7 +1046,7 @@ async def save_mcp_results(request: Request):
     """Called by mcp_server.py after Claude Desktop generates test cases.
     Stores results so React UI can display and download them"""
     data = await request.json()
-    raw_tcs = data.get("test_cases", [])
+    raw_tcs = [_normalise_mcp_tc(tc) for tc in data.get("test_cases", [])]
     queued_req_ids = {
         c.get("requirement_id") for c in generation_queue.get("chunks", [])
         if c.get("requirement_id")
@@ -1029,7 +1083,7 @@ async def save_chunk(request: Request):
     Called once per batch. Use is_last=True on the final batch."""
     global _chunk_buffer
     data = await request.json()
-    chunk = data.get("test_cases", [])
+    chunk = [_normalise_mcp_tc(tc) for tc in data.get("test_cases", [])]
     is_last = data.get("is_last", False)
     _chunk_buffer.extend(chunk)
     logger.info(f"[CHUNK SAVE] +{len(chunk)} test cases | buffer_total={len(_chunk_buffer)} | is_last={is_last}")

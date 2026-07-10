@@ -1,9 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import ReviewPointsPanel from './components/ReviewPointsPanel'
+import ReviewPointsPanel, { ALL_REVIEW_POINTS } from './components/ReviewPointsPanel'
 import ResultsTable      from './components/TCTable'
 import ScopeSelector     from './components/ScopeSelector'
 
 const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true }
+
+// Claude Desktop Skills don't use slash-command syntax (that's a Claude Code/CLI
+// feature) — Claude decides to use a skill by matching its name/description
+// against the request. So we name it explicitly in plain language instead.
+// Also requires: the "general-tc-skill" skill uploaded & toggled ON in
+// Customize > Skills, with Code execution and file creation enabled.
+const TC_SKILL_INSTRUCTION = "Use the general-tc-skill skill for test case generation. This skill defines the project's DO-178C-compliant test case generation workflow, requirement classification rules, coverage strategy, and quality validation criteria."
 const ACCEPTED   = ['.pdf', '.docx', '.xlsx']
 
 // ─── tiny helpers ─────────────────────────────────────────────────────────────
@@ -773,6 +780,7 @@ export default function App() {
           supporting_session_id: uploadData.supporting_session_id || null,
           selected_req_ids:      scopeConfig.selectedReqIds || null,
           selected_module:       scopeConfig.selectedModule  || null,
+          selected_modules:      scopeConfig.selectedModules || null,
           req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
         }),
       })
@@ -780,54 +788,92 @@ export default function App() {
       if (!qRes.ok) { setError(qData?.detail?.suggestion || 'Failed to queue'); return }
       const total = qData.total_chunks ?? 0
       if (!total) { setError('No requirements found.'); return }
-      const customPointLines = customReviewPoints.length > 0
-        ? [
-            '',
-            'ADDITIONAL REVIEW POINTS (apply these during test case generation):',
-            ...customReviewPoints.map((p, i) => `  ${i + 1}. ${p.label}`),
-          ]
-        : []
-      // Strategy: for large docs use small batches + save after each
-      // For small docs (<= 30 reqs) do it in one shot
+      // Generation Checklist items — mirrors exactly what's shown/checked in the
+      // Review Checklist panel (built-in points the user left enabled, plus any
+      // custom points they added). Rendered as plain instruction sentences under
+      // the "Generation Checklist:" header in Step 4 below.
+      const activeChecklistPoints = ALL_REVIEW_POINTS.filter(rp => reviewPoints[rp.id])
+      const checklistItems = [
+        ...activeChecklistPoints.map(rp => `${rp.label} — ${rp.desc}.`),
+        ...customReviewPoints.map(p => p.label),
+      ]
+
+      // Strategy: for large docs use small batches + save after each.
+      // For small docs (<= 30 reqs) do it in one shot.
       const BATCH_SIZE = total > 50 ? 10 : total > 30 ? 15 : total
       const totalBatches = Math.ceil(total / BATCH_SIZE)
-      const batchSteps = totalBatches > 1
+      const isMultiBatch = totalBatches > 1
+
+      const step1Lines = isMultiBatch
         ? [
             `This document has ${total} requirements across ${totalBatches} batches of ${BATCH_SIZE}.`,
-            '',
-            'CRITICAL RULE: Generate AND save each batch before moving to the next.',
-            'Do NOT accumulate test cases across batches. Do NOT wait until the end to save.',
-            '',
-            `STEP 1: Call get_generated_test_cases(batch_index=0, batch_size=${BATCH_SIZE})`,
-            'STEP 2: Generate test cases for ONLY those requirements.',
-            'STEP 3: Immediately call save_enhanced_test_cases(test_cases=[...this batch only...], is_partial=True)',
-            'STEP 4: Repeat steps 1-3 for batch_index 1, 2, 3, ... until is_last_batch=true.',
-            'STEP 5: For the final batch call save_enhanced_test_cases with is_partial=False.',
-            '',
-            '⚠ WARNING: If you accumulate all batches before saving, the payload will exceed the 1MB limit and fail.',
+            `Call tc-tool get_generated_test_cases with batch_index=0, batch_size=${BATCH_SIZE}, then repeat with batch_index=1, 2, 3, ... until is_last_batch=true.`,
+          ]
+        : [`Call tc-tool get_generated_test_cases with batch_size=${BATCH_SIZE}.`]
+
+      const step3Lines = isMultiBatch
+        ? [
+            'Generate test cases for the requirements retrieved in the CURRENT batch only. Do NOT accumulate requirements across batches — generate and save one batch at a time.',
+            'Ensure coverage of all applicable scenario types, including positive, negative, boundary, exception, and alternate flow scenarios.',
           ]
         : [
-            `STEP 1: Call tc-tool get_generated_test_cases with batch_size=${BATCH_SIZE}`,
-            'STEP 2: Generate test cases for every requirement (normal, boundary, edge, robustness).',
-            'STEP 3: Call tc-tool save_enhanced_test_cases with ALL test cases.',
+            'Generate test cases for all requirements identified in the SRS document.',
+            'Ensure coverage of all applicable scenario types, including positive, negative, boundary, exception, and alternate flow scenarios.',
           ]
+
+      const step4Lines = [
+        "Incorporate any user-defined instructions provided at runtime through the Generation Checklist. Apply all specified validation criteria, coverage expectations, and generation guidelines in addition to the standard project rules.",
+        ...(checklistItems.length > 0
+          ? ['', 'Generation Checklist:', ...checklistItems]
+          : ['', 'Generation Checklist: none provided for this run — apply the standard project rules only.']),
+      ]
+
+      const step6Lines = isMultiBatch
+        ? [
+            "After generating and validating each batch, call tc-tool save_enhanced_test_cases with that batch's test cases (is_partial=True) before moving to the next batch.",
+            'For the final batch, call save_enhanced_test_cases with is_partial=False.',
+            '⚠ Do NOT wait until all batches are generated to save — a payload over 1MB will fail.',
+          ]
+        : ['After generating and validating all test cases, call tc-tool save_enhanced_test_cases with the complete set of generated test cases.']
+
       const prompt = [
-        'Generate test cases for my SRS document using tc-tool.',
-        '', ...batchSteps, '',
-        'For each requirement generate: normal, boundary, edge, and robustness scenarios.',
-        'Every test case MUST have: traceability_req_id, test_case_id, scenario_id,',
-        'inputs (["SignalName = Value"]), expected_outcome ("OutputSignal = Value."),',
-        'design_methodology, testing_type, scenario_type, priority, objective,',
-        'preconditions, test_steps, dependent_test_cases, test_environment, remarks, module',
-        ...customPointLines,
-        '', `Total requirements: ${total}`,
+        'Generate Test Cases Using tc-tool',
+        '',
+        'Objective: Generate comprehensive test cases for the uploaded SRS document using tc-tool.',
+        '',
+        'Step 1 – Retrieve Requirements',
+        ...step1Lines,
+        '',
+        'Step 2 – Apply the Test Case Generation Skill',
+        TC_SKILL_INSTRUCTION,
+        '',
+        'Step 3 – Generate Test Cases',
+        ...step3Lines,
+        '',
+        'Step 4 – Apply Generation Checklist',
+        ...step4Lines,
+        '',
+        'Step 5 – Mandatory Test Case Fields',
+        'Every generated test case must include the following attributes: traceability_req_id, test_case_id, scenario_id, inputs (e.g., ["SignalName = Value"]), expected_outcome (e.g., "OutputSignal = Value"), design_methodology, testing_type, scenario_type, priority, objective, preconditions, test_steps, dependent_test_cases, test_environment, remarks, module.',
+        '',
+        'Step 6 – Save Generated Test Cases',
+        ...step6Lines,
+        '',
+        `Total Requirements: ${total}.`,
       ].join('\n')
+      // Best-effort fallback only — if this fails silently (focus/permissions),
+      // it no longer matters for the automated flow, since the backend now
+      // sets the clipboard itself from `prompt` right before pasting.
       await navigator.clipboard.writeText(prompt).catch(() => {})
       setAiWaiting(true)
       setTab('generate')
       // Directly launch Claude Desktop and run the full paste+send automation.
       // (Previously this was gated behind a manual popup + button click.)
-      await fetch('/api/open-claude', { method: 'POST' }).catch(() => {})
+      await fetch('/api/open-claude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      }).catch(() => {})
     } catch (e) { setError(e.message) }
   }
 
@@ -944,7 +990,7 @@ export default function App() {
               onRemindClaude={handleRemindClaude}
               onLoadMcp={handleLoadMcp}
               mcpAvailable={mcpAvailable} mcpResults={mcpResults}
-              onExport={() => setTab('export')}
+              onExport={() => setTab('export')} 
             />
           </div>
         )}

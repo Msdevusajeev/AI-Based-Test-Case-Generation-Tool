@@ -44,6 +44,17 @@ BOUNDARY_TRIGGERS = [
     "altitude", "feet", "meters", "threshold", "rate",
 ]
 
+# Signals matching these tokens are discrete (Boolean/Enum) rather than
+# numeric — numeric-only concepts like min/max/threshold do not apply to
+# them (Req 5: don't put min/max guidance in Additional Information for
+# Boolean/Enum outputs).
+BOOL_ENUM_TRIGGERS = [
+    "true", "false", "enabled", "disabled", "active", "inactive",
+    "on", "off", "valid", "invalid", "enum", "boolean", "flag",
+    "yes", "no", "set", "reset", "open", "closed", "not_available",
+    "not available", "unavailable",
+]
+
 SECURITY_KEYWORDS = [
     "authentication", "authorisation", "authorization", "encrypt",
     "token", "password", "injection", "xss", "csrf", "privilege",

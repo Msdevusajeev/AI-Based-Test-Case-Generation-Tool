@@ -46,6 +46,17 @@ PLACEHOLDER_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Req 4: an Input Value should never be a generic, unfilled hint like
+# "<invalid/out-of-range value>" or the bare phrase "out-of-range value" —
+# it should be the actual invalid/garbage value used for the test.
+GENERIC_INPUT_VALUE_PATTERNS = re.compile(
+    r"<[^>]*>|"
+    r"^out[-\s]?of[-\s]?range(\s+value)?$|"
+    r"^invalid(/out-of-range)?(\s+value)?$|"
+    r"^(exact\s+)?threshold(\s+value)?$",
+    re.IGNORECASE,
+)
+
 EMPTY_LIKE = {"", "-", "--", "none", "n/a", "tbd", "null", "nil"}
 
 
@@ -303,6 +314,17 @@ def _check_content(tc: dict, tc_id: str, req_id: str) -> List[TestCaseIssue]:
     if _is_empty(tc_id_val) or tc_id_val in ("TC_AUTO", "?"):
         issues.append(TestCaseIssue(tc_id, req_id, "warning", "test_case_id",
                                     f"test_case_id is missing or auto-assigned: {tc_id_val!r}"))
+
+    # Req 4: Input Values must be concrete, not unfilled placeholder text
+    for entry in tc.get("inputs", []) or []:
+        entry_str = str(entry)
+        value = entry_str.split(":", 1)[-1].split("=", 1)[-1].strip() if (":" in entry_str or "=" in entry_str) else entry_str
+        if value and GENERIC_INPUT_VALUE_PATTERNS.match(value.strip()):
+            issues.append(TestCaseIssue(
+                tc_id, req_id, "warning", "inputs",
+                f"Input {entry_str!r} looks like an unfilled placeholder — "
+                f"replace with the actual invalid/garbage value used for this test"
+            ))
 
     return issues
 
