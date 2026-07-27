@@ -11,7 +11,7 @@ const COLUMNS = [
   { key: 'inputs',               label: 'Inputs',                         width: 260 },
   { key: 'test_steps',           label: 'Test Steps',                     width: 280 },
   { key: '_col_i',               label: 'Expected Outputs',               width: 220 },
-  { key: '_col_j',               label: 'Depands On',                     width: 160 },
+  { key: '_col_j',               label: 'Depends On',                     width: 160 },
   { key: 'test_environment',     label: 'Test_Env',                       width: 90  },
   { key: 'testing_type',         label: 'Test_Type',                      width: 120 },
   { key: 'scenario_type',        label: 'Scenario_Type',                  width: 110 },

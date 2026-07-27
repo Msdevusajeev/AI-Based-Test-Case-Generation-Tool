@@ -36,12 +36,40 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-server      = Server("tc-tool")
+
+server = Server(
+    "tc-tool",
+    instructions=(
+        "If additional information is required before generating test cases, "
+        "you MUST call the ask_clarification tool. "
+        "Do not ask clarification questions in normal chat text. "
+        "When information is missing, ambiguous, conflicting, or a decision "
+        "is required, use ask_clarification and wait for the user's response "
+        "before proceeding."
+)
+,
+)
+
 BACKEND_URL = "http://localhost:8000"
+
+DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_debug.log")
+
+
+def _debug_log(line: str) -> None:
+    """Best-effort debug trace. Never raises — a logging failure must not
+    take down a live MCP tool call."""
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
+
+    _debug_log("LIST_TOOLS CALLED\n")
+
     return [
 
         types.Tool(
@@ -80,7 +108,13 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Saves the AI-generated test cases to the React UI. "
                 "Call this after generating test cases from the NLP context provided by "
-                "get_generated_test_cases. Pass the complete list of test cases with ALL fields."
+                "get_generated_test_cases. Pass the complete list of test cases with ALL fields. "
+                "You MUST set is_partial explicitly on every call — there is no safe default. "
+                "Set is_partial=true for every batch except the very last one for this run; "
+                "set is_partial=false ONLY on the final batch, once every requirement returned "
+                "by get_generated_test_cases (across all its batches, up to is_last_batch=true) "
+                "has been covered. Setting is_partial=false early marks the whole run 'Completed' "
+                "in the GUI even though requirements are still unprocessed."
             ),
             inputSchema={
                 "type": "object",
@@ -89,9 +123,41 @@ async def list_tools() -> list[types.Tool]:
                         "type": "array",
                         "description": "The AI-generated test cases with all required fields populated",
                         "items": {"type": "object"}
+                    },
+                    "is_partial": {
+                        "type": "boolean",
+                        "description": (
+                            "true = more batches are still coming, keep the run 'in progress'. "
+                            "false = this is the last batch, finalise and mark 'Completed'. "
+                            "No default — you must decide this explicitly every call."
+                        )
                     }
                 },
-                "required": ["test_cases"]
+                "required": ["test_cases", "is_partial"]
+            }
+        ),
+
+        types.Tool(
+            name="ask_clarification",
+            description=(
+                "MANDATORY TOOL. If there is ANY ambiguity, uncertainty, "
+                "missing information, conflicting requirements, domain mismatch, "
+                "or decision-making required, you MUST call this tool. "
+                "Never ask the question directly in chat. "
+                "All user-facing questions must be sent through this tool so they "
+                "can be displayed in the React GUI and answered by the user."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The clarifying question to show in the GUI"},
+                    "options": {
+                        "type": "array",
+                        "description": "Optional short answer choices to show as buttons, e.g. ['Treat as error — ignore filter', 'It's intentional — domain differs for this batch']",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["question"]
             }
         ),
 
@@ -122,6 +188,8 @@ async def call_tool(
     arguments: dict,
 ) -> list[types.TextContent]:
 
+    _debug_log(f"TOOL CALLED: {name}\n")
+
     if name == "get_tool_status":
         result = json.dumps({
             "status":   "running",
@@ -140,6 +208,12 @@ async def call_tool(
             ]
         }, indent=2)
 
+    elif name == "ask_clarification":
+        question = arguments.get("question", "")
+        options  = arguments.get("options") or None
+        loop     = asyncio.get_event_loop()
+        result   = await loop.run_in_executor(None, _ask_clarification, question, options)
+
     elif name == "get_generated_test_cases":
         _bi = int(arguments.get("batch_index", 0))
         _bs = int(arguments.get("batch_size",  15))
@@ -151,7 +225,10 @@ async def call_tool(
 
     elif name == "save_enhanced_test_cases":
         test_cases = arguments.get("test_cases", [])
-        is_partial = bool(arguments.get("is_partial", False))
+        # Default True (safe: "more coming") not False (unsafe: silently finalizes).
+        # is_partial is required in the schema above, so this default should only
+        # ever be hit if an old cached tool schema is still loaded somewhere.
+        is_partial = bool(arguments.get("is_partial", True))
         loop       = asyncio.get_event_loop()
         result     = await loop.run_in_executor(
             None, lambda: _save_enhanced_cases(test_cases, is_partial=is_partial)
@@ -169,7 +246,85 @@ async def call_tool(
     else:
         result = json.dumps({"error": f"Unknown tool: {name}"})
 
+    result = _with_clarification_reminder(result, name)
     return [types.TextContent(type="text", text=result)]
+
+
+CLARIFICATION_REMINDER = (
+    "REMINDER: if this result contains a blank/missing signal name, a default "
+    "\"General\" module, ambiguous polarity on a deactivation requirement, or a "
+    "scenario that doesn't cleanly map to normal/boundary/edge/robustness/transition, "
+    "you MUST call ask_clarification with a specific question before generating "
+    "test cases for that item. Never raise the question in chat text — the user "
+    "only sees questions raised through ask_clarification."
+)
+
+COVERAGE_REMINDER = (
+    "REMINDER: per general-tc-skill, every requirement needs all 4 core "
+    "Scenario_Type values at minimum — Normal, Boundary, Edge, Robustness — not "
+    "just Normal. Add MCDC, Beyond-Range, Fault, and Timing wherever the "
+    "requirement has a Boolean decision, a bounded parameter, a hardware/software "
+    "dependency, or a time threshold. These are validated end-to-end now — use "
+    "the exact Scenario_Type value, don't fold everything back into Normal."
+)
+
+
+def _with_clarification_reminder(result: str, tool_name: str) -> str:
+    """Re-injects standing directives into tool results the moment Claude is
+    about to act on them, rather than relying solely on the one-time server
+    `instructions=` text shown at MCP handshake (which loses influence many
+    tool calls into a batch session — proven by the ask_clarification issue
+    this mechanism was originally built for).
+    - CLARIFICATION_REMINDER goes on every result except ask_clarification's own.
+    - COVERAGE_REMINDER goes only on get_generated_test_cases results — the
+      exact moment Claude is about to decide scenario-type depth for that
+      batch — rather than on every call, so it doesn't dilute into noise."""
+    if tool_name == "ask_clarification":
+        return result
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict):
+            data["_reminder"] = CLARIFICATION_REMINDER
+            if tool_name == "get_generated_test_cases":
+                data["_coverage_reminder"] = COVERAGE_REMINDER
+            return json.dumps(data, indent=2)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return json.dumps({"result": result, "_reminder": CLARIFICATION_REMINDER})
+
+
+def _ask_clarification(question: str, options: list | None = None) -> str:
+    """Posts a clarifying question (optionally multiple-choice) to the backend
+    and blocks until the GUI answers it (or the backend's own 300s timeout
+    returns first). The backend holds the wait; this call just needs a
+    client-side timeout long enough not to give up before the backend does."""
+    import urllib.request
+
+    _debug_log(f"ASK_CLARIFICATION CALLED: {question}\n")
+
+    body = {"question": question}
+    if options:
+        body["options"] = options
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{BACKEND_URL}/api/mcp/clarify",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=310) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        return json.dumps({"answered": False, "answer": None, "error": str(e)})
+
+    if data.get("answered"):
+        return json.dumps({"answered": True, "answer": data.get("answer", "")})
+    return json.dumps({
+        "answered": False,
+        "answer": None,
+        "note": "No response from the user in time — proceed using your best judgement.",
+    })
 
 
 # ─── TOOL IMPLEMENTATIONS ─────────────────────────────────────────────────────
@@ -468,7 +623,15 @@ def _extract_nlp_context_for_queue(batch_index: int = 0, batch_size: int = 15) -
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
 
+        job_status = data.get("job_status", "RUNNING")
+        if job_status in ("PAUSED", "STOPPED"):
+            return json.dumps({
+                "status": job_status.lower(),
+                "message": data.get("message", f"Generation is {job_status.lower()} by the user."),
+            })
+
         chunks = data.get("chunks", [])
+        rp6_merge = bool(data.get("rp6_merge", False))
         if not chunks:
             return json.dumps({
                 "status":  "empty",
@@ -601,6 +764,15 @@ def _extract_nlp_context_for_queue(batch_index: int = 0, batch_size: int = 15) -
             "is_last_batch":      is_last_batch,
             "batch_req_count":    len(requirements_context),
             "total_requirements": total_reqs,
+            "smart_merge":        rp6_merge,
+            "smart_merge_instructions": (
+                "SMART MERGING ACTIVE: Before generating, analyse ALL requirements in this batch. "
+                "Group requirements that describe the same behaviour or feature. "
+                "For each group: generate ONE combined test case covering all grouped requirements. "
+                "Set traceability_req_id = comma-separated IDs of all merged reqs (e.g. REQ_001, REQ_002). "
+                "For partially overlapping requirements: generate shared scenarios once, then add "
+                "gap-filling scenarios for uncovered parts only with their specific req ID."
+) if rp6_merge else None,
             "requirements":       requirements_context,
             "schema": {
                 "description": (
@@ -665,6 +837,7 @@ def _save_enhanced_cases(test_cases: list, is_partial: bool = False) -> str:
     """
     try:
         import urllib.request
+        import urllib.error
 
         if not test_cases:
             return json.dumps({"error": "No test cases provided"})
@@ -728,6 +901,28 @@ def _save_enhanced_cases(test_cases: list, is_partial: bool = False) -> str:
             "message": "All test cases saved. Click Load Results in the tool.",
         })
 
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            try:
+                body = json.loads(e.read().decode())
+                detail = body.get("detail", {}) if isinstance(body, dict) else {}
+                job_status = detail.get("job_status", "STOPPED") if isinstance(detail, dict) else "STOPPED"
+                message = detail.get("message") if isinstance(detail, dict) else None
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                job_status, message = "STOPPED", None
+            if job_status == "PAUSED":
+                return json.dumps({
+                    "status": "paused",
+                    "message": message or ("Generation is paused by the user from the GUI. This batch "
+                                           "was NOT saved. Hold it and retry the identical save once the "
+                                           "user resumes — do not move on to the next batch meanwhile."),
+                })
+            return json.dumps({
+                "status": "stopped",
+                "message": message or ("Generation was stopped by the user from the GUI. Do NOT retry "
+                                       "this save and do not generate further test cases for this run."),
+            })
+        return json.dumps({"error": f"Save failed: HTTP {e.code} {e.reason}"})
     except Exception as e:
         return json.dumps({
             "error": f"Save failed: {str(e)}",

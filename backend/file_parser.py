@@ -249,6 +249,79 @@ def parse_xlsx(file_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+_TXT_REQ_KEYWORDS   = re.compile(r'\b(?:shall|must|should|will)\b', re.IGNORECASE)
+_TXT_MD_HEADING     = re.compile(r'^(#{1,6})\s+(.+)$')
+_TXT_NUM_HEADING    = re.compile(r'^(\d+(?:\.\d+){0,3})\.?\s+(.+)$')
+_TXT_ALLCAPS_HEADING = re.compile(r'^[A-Z][A-Z0-9 &/\-]{2,79}$')
+
+
+def parse_txt(file_bytes: bytes) -> str:
+    """
+    Parses a plain .txt SRS file. Unlike PDF/DOCX, plain text carries no
+    bold/font/style metadata, so [MODULE: ...] heading detection falls back
+    to text conventions instead of formatting:
+      - Markdown-style headings:  # Section, ## Subsection, ...
+      - Numbered section headings: "3.2 Engine Control Logic"
+      - Short ALL-CAPS lines:  "ENGINE CONTROL LOGIC"
+    A line is never treated as a heading if it contains shall/must/should/will
+    — i.e. it reads like a requirement, not a title — mirroring the
+    disqualification parse_pdf applies via _REQ_LINE. Non-requirement
+    admin sections (Introduction, Scope, References, ...) are filtered via
+    the same _NON_REQ_SECTIONS regex the PDF/DOCX parsers use, so they don't
+    steal module ownership from real requirement sections.
+    """
+    try:
+        try:
+            text = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = file_bytes.decode("latin-1")
+    except Exception as e:
+        raise RuntimeError(f"TXT parsing error: {e}")
+
+    parts: list = []
+    heading_stack: dict = {}  # level -> last-seen heading text at that level
+
+    try:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            level, heading_text = None, None
+
+            m = _TXT_MD_HEADING.match(line)
+            if m:
+                level, heading_text = len(m.group(1)), m.group(2).strip()
+            elif len(line) <= 100 and not _TXT_REQ_KEYWORDS.search(line):
+                m = _TXT_NUM_HEADING.match(line)
+                if m:
+                    level, heading_text = m.group(1).count(".") + 1, m.group(2).strip()
+                elif _TXT_ALLCAPS_HEADING.match(line) and any(c.isalpha() for c in line):
+                    level, heading_text = 1, line.title()
+
+            if level and heading_text and not _NON_REQ_SECTIONS.match(heading_text):
+                heading_stack[level] = heading_text
+                for lvl in list(heading_stack):
+                    if lvl > level:
+                        del heading_stack[lvl]
+                sorted_levels = sorted(heading_stack)
+                if len(sorted_levels) >= 2:
+                    module_name = f"{heading_stack[sorted_levels[-2]]} > {heading_stack[sorted_levels[-1]]}"
+                else:
+                    module_name = heading_text
+                parts.append(f"\n## {heading_text}")
+                parts.append(f"[MODULE: {module_name}]")
+            else:
+                parts.append(line)
+    except Exception as e:
+        raise RuntimeError(f"TXT parsing error: {e}")
+
+    return "\n".join(parts)
+
+
 def parse_file(filename: str, file_bytes: bytes) -> str:
     if not filename or not file_bytes:
         raise ValueError("Filename and file content are required")
@@ -259,7 +332,9 @@ def parse_file(filename: str, file_bytes: bytes) -> str:
         return parse_docx(file_bytes)
     elif ext in ("xlsx", "xls"):
         return parse_xlsx(file_bytes)
+    elif ext == "txt":
+        return parse_txt(file_bytes)
     else:
         raise ValueError(
-            f"Unsupported file type: .{ext}. Accepted: .pdf, .docx, .xlsx"
+            f"Unsupported file type: .{ext}. Accepted: .pdf, .docx, .xlsx, .txt"
         )

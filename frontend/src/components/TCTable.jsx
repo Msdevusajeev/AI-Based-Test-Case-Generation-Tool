@@ -11,7 +11,7 @@ const COLUMNS = [
   { key: 'inputs',               label: 'Inputs',                         width: 260 },
   { key: 'test_steps',           label: 'Test Steps',                     width: 280 },
   { key: '_col_i',               label: 'Expected Outputs',               width: 220 },
-  { key: '_col_j',               label: 'Depands On',                     width: 160 },
+  { key: '_col_j',               label: 'Depends On',                     width: 160 },
   { key: 'test_environment',     label: 'Test_Env',                       width: 90  },
   { key: 'testing_type',         label: 'Test_Type',                      width: 120 },
   { key: 'scenario_type',        label: 'Scenario_Type',                  width: 110 },
@@ -20,151 +20,50 @@ const COLUMNS = [
 ]
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────
-function listToStr(val) {
-  if (Array.isArray(val)) return val.filter(Boolean).join('\n')
-  return val ? String(val) : ''
-}
-
-function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : '' }
-
 function moduleAlphaOnly(module) {
   const cleaned = (module || '').replace(/[^A-Za-z\s]/g, '').replace(/\s+/g, ' ').trim()
   return cleaned || 'General'
 }
 
-function parseSignalValue(entry) {
-  const m = /^(.+?)[:\s]*[=:]\s*(.+)$/.exec((entry || '').trim())
-  if (m) return [m[1].trim(), m[2].trim()]
-  return [entry.trim(), entry.trim()]
-}
-
-// ─── COLUMN E: Test Details Description ────────────────────────────────────
-// Narrative description of what the test does — scenario-type driven.
-// Matches output_generator.py _col_e_test_details exactly.
-const DETAIL_MAP = {
-  normal: (
-    'Verifies the primary activation path. All input conditions are set to their ' +
-    'nominal required values simultaneously to confirm the system output activates ' +
-    'as specified. This scenario also serves as the baseline reference for all ' +
-    'MC/DC independence pair tests.'
-  ),
-  boundary: (
-    'Verifies MC/DC independence by varying exactly one input condition at a time ' +
-    'while holding all other conditions at their required values. Confirms the ' +
-    'output state change is solely and independently controlled by the varied ' +
-    'condition, satisfying the MC/DC coverage criterion per DO-178C.'
-  ),
-  edge: (
-    'Verifies system behaviour when all input conditions are simultaneously ' +
-    'inactive, conflicting, or at non-activating values. Confirms the output ' +
-    'remains in its safe inactive state and the system correctly handles this ' +
-    'configuration without any unintended activation.'
-  ),
-  robustness: (
-    'Verifies system stability and fault tolerance when inputs receive invalid, ' +
-    'out-of-range, or unavailable values. Confirms the system does not crash, ' +
-    'produce undefined outputs, or enter an unsafe state. Also tests recovery ' +
-    'behaviour when inputs return to valid range.'
-  ),
-  transition: (
-    'Verifies correct state transition behaviour as the system moves between ' +
-    'active and inactive states. Confirms output activation and deactivation ' +
-    'sequences are correct, partial activation conditions are handled properly, ' +
-    'and state changes occur at the expected trigger points.'
-  ),
-}
+// ─── COLUMNS E/F/I/J/N/O ─────────────────────────────────────────────────────
+// These are narrative/derived text that the BACKEND computes once
+// (output_generator.compute_gui_display_fields) and attaches to every test
+// case as test_details_description / test_precondition_display /
+// expected_outputs_display / depends_on_display / remarks_display /
+// module_display — the exact same text written into the Excel/Word export.
+//
+// This file used to re-derive all six columns independently in JS (its own
+// copy of the scenario-type templates, its own signal-name parsing, its own
+// "depends on" formatting). That second implementation drifted from the
+// Python one over time — it didn't know about real signal/output names or
+// the deterministic phrasing variants — which is why Test Details
+// Description differed between the GUI and the Excel export. Do not
+// reintroduce a JS re-derivation here; if a column is missing, fix the
+// backend function and it will be correct in both places at once.
 
 function colE(tc) {
-  const sc   = (tc.scenario_type || '').toLowerCase()
-  const base = DETAIL_MAP[sc] || 'Verifies functional system behaviour as specified in the requirement.'
-  const extra = []
-  if (tc.design_methodology) extra.push(`Design methodology: ${tc.design_methodology}.`)
-  if (tc.module)             extra.push(`Module under test: ${tc.module}.`)
-  return extra.length ? base + '\n' + extra.join('  ') : base
+  return tc.test_details_description || 'Verifies functional system behaviour as specified in the requirement.'
 }
 
-// ─── COLUMN F: Test Precondition ────────────────────────────────────────────
 function colF(tc) {
-  if (!tc.preconditions || !tc.preconditions.length) return ''
-  return listToStr(tc.preconditions)
+  return tc.test_precondition_display || ''
 }
 
-// ─── COLUMN I: Expected Outputs ─────────────────────────────────────────────
 function colI(tc) {
-  const raw = tc.expected_outcome || ''
-  if (!raw) return ''
-  return raw.split('.')[0].trim()
+  return tc.expected_outputs_display || (tc.expected_outcome || '').split('.')[0].trim()
 }
 
-// ─── COLUMN J: Depends On ───────────────────────────────────────────────────
 function colJ(tc) {
-  const raw = (tc.dependent_test_cases || 'None').trim()
-  if (/_SC-\d{3}$/.test(raw)) return raw
-  if (/_SC_\d{3}$/.test(raw)) return raw
-  if (raw.toLowerCase() === 'none') return 'None'
-  return `${tc.test_case_id}_SC-001`
+  return tc.depends_on_display || 'None'
 }
 
-// ─── COLUMN N: Remarks ──────────────────────────────────────────────────────
 function colN(tc) {
-  const bullets = []
-  bullets.push(`• Testing Type: ${cap(tc.testing_type)} | Scenario Type: ${cap(tc.scenario_type)}`)
+  return tc.remarks_display || ''
+}
 
-  const scWhat = {
-    normal:     'All input values set to normal/valid values; correct system output is verified.',
-    boundary:   'Input boundary values tested: minimum, maximum, min-1, max+1 for each parameter.',
-    edge:       'Edge case conditions tested (state transitions, simultaneous changes, unusual-but-valid states).',
-    robustness: 'Invalid/out-of-range input values tested; system must respond safely without crash.',
-    transition: 'State transitions tested: Inactive→Active, Active→Inactive, and partial activation sequences.',
-  }
-  bullets.push(`• What is tested: ${scWhat[tc.scenario_type] || 'Functional system behaviour verified.'}`)
-
-  for (const entry of (tc.inputs || [])) {
-    const [name, value] = parseSignalValue(entry)
-    if (!name || !value) continue
-    const nl = name.toLowerCase()
-    if (['test environment', 'all prerequisite', 'sub-requirements'].includes(nl)) continue
-    const vl = value.toLowerCase()
-    if (tc.scenario_type === 'boundary') {
-      if (vl.includes('max') || vl.includes('maximum'))
-        bullets.push(`• ${name}: maximum value is tested`)
-      else if (vl.includes('min') || vl.includes('minimum'))
-        bullets.push(`• ${name}: minimum value is tested`)
-      else
-        bullets.push(`• ${name}: boundary value '${value}' is tested`)
-    } else if (tc.scenario_type === 'edge') {
-      bullets.push(`• ${name}: edge-case value '${value}' is tested`)
-    } else if (tc.scenario_type === 'robustness') {
-      bullets.push(`• ${name}: invalid/out-of-range value '${value}' is tested`)
-    } else if (tc.scenario_type === 'transition') {
-      bullets.push(`• ${name}: transitions to/from '${value}' — state change verified`)
-    }
-  }
-
-  const inputsRaw = listToStr(tc.inputs).toLowerCase()
-  if (['icd', 'derived', 'interface'].some(kw => inputsRaw.includes(kw))) {
-    bullets.push('• Input source: Values derived from ICD document (not explicitly defined in SRS).')
-  } else {
-    bullets.push('• Input source: Input values explicitly defined in SRS specification.')
-  }
-
-  if (tc.remarks) {
-    const rawParts = tc.remarks.split(/\s*[|\n•]+\s*/).filter(Boolean)
-    for (const part of rawParts) {
-      const p = part.trim()
-      if (!p) continue
-      if (/test\s+basis|input\s+values\s+derived\s+from\s+srs|srs\s+requirement\s+\w/i.test(p)) continue
-      if (/enum|sub.req|note|reference|derived from icd|document context/i.test(p)) {
-        bullets.push(`• ${p}`)
-      }
-    }
-  }
-
-  return bullets.join('\n')   // ← was missing
-}                              // ← was missing (closing brace for colN)
-
-// ─── COLUMN O: Module ───────────────────────────────────────────────────────
-function colO(tc) { return moduleAlphaOnly(tc.module) }
+function colO(tc) {
+  return tc.module_display || moduleAlphaOnly(tc.module)
+}
 
 // ─── BADGE ──────────────────────────────────────────────────────────────────
 const BADGE_MAP = {

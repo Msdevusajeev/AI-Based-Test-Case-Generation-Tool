@@ -14,7 +14,7 @@ Exact column layout (matches template):
   J(10)  Test Steps           -- standalone column (after input sub-cols)
   K(11)  Expected Outputs     -- merged header over output signal sub-columns
   L(12)+ [output signal sub-columns, dynamic]
-  M(13)  Depands On           -- TC_ID + Scenario No concatenated (Req 10)
+  M(13)  Depends On           -- TC_ID + Scenario No concatenated (Req 10)
   N(14)  Test_Env
   O(15)  Test_Type
   P(16)  Scenario_Type
@@ -31,7 +31,7 @@ import io
 import re
 import hashlib
 from datetime import datetime
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -554,9 +554,58 @@ def _sc_label(sc_no: int) -> str:
 #   • Test Objective (from col D/E)
 #   • Test Steps that are related to the identified input parameter names (from H, I... cols)
 
-def _description_signal_names(tc: TestCase, limit: int = 2) -> str:
+def _varied_signal_names(tc: TestCase, siblings: List[TestCase], limit: int) -> str:
+    """
+    For an MC/DC independence-pair row (boundary scenario, SC_002+), finds the
+    signal name(s) that actually differ from this TC's own SC_001/normal
+    baseline sibling. Returns "" if no baseline is found or nothing differs,
+    so the caller can fall back to the generic first-N-signals behaviour.
+    """
+    baseline = next(
+        (s for s in siblings
+         if s.test_case_id == tc.test_case_id
+         and s.scenario_id != tc.scenario_id
+         and (s.scenario_type or "").lower() == "normal"),
+        None,
+    )
+    if not baseline:
+        return ""
+
+    skip = ("test environment", "all prerequisite", "sub-requirements")
+    base_map = {
+        name: val for name, val in (_parse_signal_value(e) for e in baseline.inputs)
+        if name and name.lower() not in skip
+    }
+    tc_map = {
+        name: val for name, val in (_parse_signal_value(e) for e in tc.inputs)
+        if name and name.lower() not in skip
+    }
+
+    varied = [name for name, val in tc_map.items()
+              if name in base_map and base_map[name] != val]
+    if not varied:
+        return ""
+    return " and ".join(varied[:limit])
+
+
+def _description_signal_names(tc: TestCase, limit: int = 2,
+                              siblings: Optional[List[TestCase]] = None) -> str:
     """Pulls 1-2 real input signal names from this TC for a context-specific
-    description, instead of a generic phrase."""
+    description, instead of a generic phrase.
+
+    For MC/DC independence-pair rows this used to always name the first N
+    signals declared on the TC regardless of which one this specific
+    scenario actually isolates — so every boundary row under the same
+    TC_ID quoted the same one or two signals even when a different signal
+    was the one being flipped. When `siblings` (the other scenarios sharing
+    this TC_ID) is supplied, prefer the signal(s) that differ from the
+    SC_001/normal baseline — that is the signal genuinely under test here.
+    """
+    if siblings:
+        varied = _varied_signal_names(tc, siblings, limit)
+        if varied:
+            return varied
+
     names = []
     for entry in tc.inputs:
         name, _ = _parse_signal_value(entry)
@@ -586,7 +635,7 @@ def _description_variant_index(tc: TestCase, modulo: int) -> int:
     return int(hashlib.md5(key.encode()).hexdigest(), 16) % modulo
 
 
-def _col_e_test_details(tc: TestCase) -> str:
+def _col_e_test_details(tc: TestCase, siblings: Optional[List[TestCase]] = None) -> str:
     """
     Column E — Test Details Description.
     A narrative, requirement-specific explanation of what this test does and
@@ -596,8 +645,13 @@ def _col_e_test_details(tc: TestCase) -> str:
     Does NOT repeat inputs, expected output, preconditions, or the test
     objective, and does NOT restate Design Methodology / Module, since those
     already have their own dedicated columns (Req 1).
+
+    `siblings` — the other scenarios sharing this TC_ID — lets MC/DC
+    (boundary) rows name the signal actually being isolated in THIS row
+    rather than always naming the first declared input(s); see
+    _description_signal_names.
     """
-    sig = _description_signal_names(tc)
+    sig = _description_signal_names(tc, siblings=siblings)
     out = _description_output_name(tc)
     req = tc.traceability_req_id or "the requirement"
 
@@ -741,7 +795,7 @@ def _remarks_bullets(tc: TestCase) -> str:
 
 def _depends_on(raw_dep: str, tc_id: str, sc_no: int) -> str:
     """
-    Depands On column.
+    Depends On column.
     Format: TC_UT_001_SC-001  (hyphen between SC and number)
 
     The generator writes:
@@ -782,7 +836,7 @@ def _write_headers(ws, input_signals: List[str], output_signals: List[str]) -> D
       Col 7+n_inputs: Test Steps       (rows 1-2 merged)
       Col 7+n_inputs+1: Expected Outputs (row 1 merged across output sub-cols)
         output signal sub-headers (row 2)  ← same treatment as input sub-headers
-      Col 7+n_inputs+1+n_outputs: Depands On   (rows 1-2 merged)  [sic]
+      Col 7+n_inputs+1+n_outputs: Depends On   (rows 1-2 merged)  [sic]
       Col ...: Test_Env       (rows 1-2 merged)
       Col ...: Test_Type      (rows 1-2 merged)
       Col ...: Scenario_Type  (rows 1-2 merged)
@@ -870,7 +924,7 @@ def _write_headers(ws, input_signals: List[str], output_signals: List[str]) -> D
 
     # Suffix columns — all same blue header (Req 6)
     suffix = [
-        ("Depands On",                      12),   # sic — typo preserved from template
+        ("Depends On",                      12),   # sic — typo preserved from template
         ("Test_Env",                        12),
         ("Test_Type",                       16),
         ("Scenario_Type",                   14),
@@ -939,11 +993,52 @@ def _extract_output_value_only(expected_outcome: str) -> str:
     return first_clause if first_clause else ""
 
 
+# ─── GUI/EXPORT PARITY ────────────────────────────────────────────────────────
+# Single source of truth for the narrative/derived columns (Test Details
+# Description, Test Precondition, Expected Outputs, Depends On, Remarks,
+# Module) so the React GUI and the Excel/Word export always show identical
+# text. Previously the GUI (TCTable.jsx / ResultsTable.jsx) re-implemented
+# these columns from scratch in JS — a static, non-signal-aware version of
+# _col_e_test_details that had drifted from this Python implementation.
+# The backend now computes them once per test case and the API attaches the
+# result to the payload; the frontend must read these fields directly rather
+# than recomputing them.
+
+def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] = None) -> dict:
+    """Computes the same derived columns used in generate_excel/generate_docx
+    and returns them as a flat dict of field_name -> display string, ready to
+    be attached to the TestCase (or the raw dict backing it) before it is
+    sent to the GUI.
+
+    `siblings` should be every other TestCase sharing this batch (ideally at
+    least everything sharing this TC_ID) so that MC/DC boundary rows can
+    identify the actually-varied signal — see _description_signal_names.
+    """
+    sc_lbl = (tc.scenario_id or "").strip()
+    try:
+        sc_no = int(sc_lbl.replace("SC_", "")) if sc_lbl.startswith("SC_") else 1
+    except ValueError:
+        sc_no = 1
+
+    expected_first_sentence = _extract_output_value_only(tc.expected_outcome)
+    if not expected_first_sentence and tc.expected_outcome:
+        expected_first_sentence = tc.expected_outcome.split(".")[0].strip()
+
+    return {
+        "test_details_description":  _col_e_test_details(tc, siblings=siblings),
+        "test_precondition_display": _col_f_precondition(tc, []),
+        "expected_outputs_display":  expected_first_sentence,
+        "depends_on_display":        _depends_on(tc.dependent_test_cases, tc.test_case_id, sc_no),
+        "remarks_display":           _remarks_bullets(tc),
+        "module_display":            _module_alpha_only(tc.module),
+    }
+
+
 # ─── STANDALONE ROW WRITER ────────────────────────────────────────────────────
 
 def _write_tc_row(ws, row_idx: int, tc: TestCase,
                   col_map: dict, in_sigs: List[str], out_sigs: List[str],
-                  signal_defaults: dict = None) -> None:
+                  signal_defaults: dict = None, siblings: Optional[List[TestCase]] = None) -> None:
     """
     Writes one TC row into worksheet ws at row_idx.
 
@@ -973,7 +1068,7 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
     _p(col_map["TC_ID"],                   tc_id)
     _p(col_map["Scenario No"],             sc_lbl)
     _p(col_map["Test Objective"],          tc.objective)
-    _p(col_map["Test Details Description"], _col_e_test_details(tc))
+    _p(col_map["Test Details Description"], _col_e_test_details(tc, siblings=siblings))
     _p(col_map["Test Precondition"],        _col_f_precondition(tc, in_sigs))
 
     # ── Input sub-columns ──────────────────────────────────────────────────────
@@ -1010,7 +1105,7 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
         _p(col_map["Outputs_start"], _extract_output_value_only(tc.expected_outcome), center=True)
 
     # ── Suffix columns ─────────────────────────────────────────────────────────
-    _p(col_map["Depands On"],
+    _p(col_map["Depends On"],
        _depends_on(tc.dependent_test_cases, tc_id, sc_no))
     _p(col_map["Test_Env"],      tc.test_environment)
     _p(col_map["Test_Type"],     tc.testing_type)
@@ -1066,7 +1161,7 @@ def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
       Req 7:  Module = alpha-only
       Req 8:  Remarks = bullet format, no test-basis, SC description
       Req 9:  Precondition includes pre-set values + output-influence note
-      Req 10: Depands On = TC_ID + SC_NNN
+      Req 10: Depends On = TC_ID + SC_NNN
     """
     wb = openpyxl.Workbook()
     # Remove the default empty sheet created by openpyxl — we do NOT want a
@@ -1139,7 +1234,8 @@ def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
 
         for row_idx, tc in enumerate(req_tcs, start=3):
             _write_tc_row(ws_r, row_idx, tc, r_cmap, r_in, r_out,
-                          signal_defaults=_build_signal_defaults(req_tcs))
+                          signal_defaults=_build_signal_defaults(req_tcs),
+                          siblings=req_tcs)
 
     # Summary sheet always last
     wb.move_sheet("Summary", offset=len(wb.worksheets) - 1)
@@ -1196,12 +1292,12 @@ def generate_docx(test_cases: List[TestCase], removed_count: int) -> bytes:
                 ("TC_ID",                   tc_id),
                 ("Scenario No",             sc_lbl),
                 ("Test Objective",          tc.objective),
-                ("Test Details Description", _col_e_test_details(tc)),
+                ("Test Details Description", _col_e_test_details(tc, siblings=by_module[module])),
                 ("Test Precondition",       _col_f_precondition(tc, input_signals)),
                 ("Inputs",                  _list_to_str(tc.inputs)),
                 ("Test Steps",              _list_to_str(tc.test_steps)),
                 ("Expected Outputs",        tc.expected_outcome),
-                ("Depands On",              _depends_on(tc.dependent_test_cases, tc_id, sc_no)),
+                ("Depends On",              _depends_on(tc.dependent_test_cases, tc_id, sc_no)),
                 ("Test_Env",                tc.test_environment),
                 ("Test_Type",               tc.testing_type),
                 ("Scenario_Type",           tc.scenario_type),

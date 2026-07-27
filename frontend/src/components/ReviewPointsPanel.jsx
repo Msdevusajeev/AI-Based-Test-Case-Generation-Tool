@@ -23,6 +23,11 @@ export const REVIEW_POINTS = [
     label: 'Rule-Based Remarks',
     desc: 'Auto-detect risks, PCI concerns, and missing specs',
   },
+  {
+    id: 'rp6',
+    label: 'Smart Requirement Merging',
+    desc: 'Analyse requirements for overlaps — merge related ones into a single test case covering both IDs',
+  },
 ]
 
 // Rendered separately in the UI (distinct red "destructive" styling) but it's

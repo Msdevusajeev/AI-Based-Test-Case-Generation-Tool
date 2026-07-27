@@ -3,15 +3,15 @@ import ReviewPointsPanel, { ALL_REVIEW_POINTS } from './components/ReviewPointsP
 import ResultsTable      from './components/TCTable'
 import ScopeSelector     from './components/ScopeSelector'
 
-const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true }
+const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true, rp6: false }
 
 // Claude Desktop Skills don't use slash-command syntax (that's a Claude Code/CLI
 // feature) — Claude decides to use a skill by matching its name/description
 // against the request. So we name it explicitly in plain language instead.
 // Also requires: the "general-tc-skill" skill uploaded & toggled ON in
 // Customize > Skills, with Code execution and file creation enabled.
-const TC_SKILL_INSTRUCTION = "Use the general-tc-skill skill for test case generation. This skill defines the project's DO-178C-compliant test case generation workflow, requirement classification rules, coverage strategy, and quality validation criteria."
-const ACCEPTED   = ['.pdf', '.docx', '.xlsx']
+const TC_SKILL_INSTRUCTION = "Use the general-tc-skill skill for test case generation. This skill defines the project's test case generation workflow, requirement classification guidelines, coverage strategy, and quality validation criteria to ensure consistent and comprehensive test case creation."
+const ACCEPTED   = ['.pdf', '.docx', '.xlsx', '.txt']
 
 // ─── tiny helpers ─────────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ function DropZone({ label, required, file, loading, error, onFile, onClear }) {
       onDragLeave={() => setDrag(false)}
       onDrop={onDrop}
     >
-      <input ref={ref} type="file" accept=".pdf,.docx,.xlsx" className="hidden"
+      <input ref={ref} type="file" accept=".pdf,.docx,.xlsx,.txt" className="hidden"
         onChange={e => onFile(e.target.files[0])} />
 
       <div className="p-6">
@@ -57,7 +57,7 @@ function DropZone({ label, required, file, loading, error, onFile, onClear }) {
         ) : file ? (
           <div className="flex items-center gap-4">
             <div className="w-12 h-12 rounded-xl bg-green-500/10 border border-green-500/30 flex items-center justify-center text-2xl flex-shrink-0">
-              {ext === 'pdf' ? '📄' : ext === 'docx' || ext === 'doc' ? '📝' : '📊'}
+              {ext === 'pdf' ? '📄' : ext === 'docx' || ext === 'doc' ? '📝' : ext === 'txt' ? '📃' : '📊'}
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium text-text truncate">{file.name}</p>
@@ -187,7 +187,7 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
           <div className="space-y-2">
             {(files.supportingList || []).map((f, idx) => (
               <div key={idx} className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-green-500/30 bg-green-500/5">
-                <span className="text-xl">{f.name?.endsWith('.pdf') ? '📄' : f.name?.endsWith('.docx') ? '📝' : '📊'}</span>
+                <span className="text-xl">{f.name?.endsWith('.pdf') ? '📄' : f.name?.endsWith('.docx') ? '📝' : f.name?.endsWith('.txt') ? '📃' : '📊'}</span>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm text-text truncate">{f.name}</p>
                   <p className="text-xs text-green-400">✓ Uploaded</p>
@@ -204,7 +204,7 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
               onDragOver={e => e.preventDefault()}
               onDrop={e => { e.preventDefault(); Array.from(e.dataTransfer.files).forEach(f => onFile('supporting', f)) }}
             >
-              <input id="sup-input" type="file" accept=".pdf,.docx,.xlsx" multiple className="hidden"
+              <input id="sup-input" type="file" accept=".pdf,.docx,.xlsx,.txt" multiple className="hidden"
                 onClick={e => { e.target.value = '' }}
               onChange={e => Array.from(e.target.files).forEach(f => onFile('supporting', f))} />
               <div className="p-4 flex items-center gap-4">
@@ -218,6 +218,7 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
                     <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.pdf</span>
                     <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.docx</span>
                     <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.xlsx</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.txt</span>
                     <span className="text-[10px] text-dim/60 ml-1">Multiple files supported</span>
                   </div>
                 </div>
@@ -333,10 +334,151 @@ function TokenUsageWidget({ aiWaiting }) {
   )
 }
 
+const STAGES = ['Request Submitted', 'Requirement Analysis', 'Test Case Generation', 'Completion']
+
+function StageStepper({ stage, activityLog, requestId, controlState }) {
+  if (!stage) return null
+  const idx = STAGES.indexOf(stage)
+  const last = activityLog[activityLog.length - 1]
+  return (
+    <div className="flex-shrink-0 mx-6 mt-3 px-4 py-2.5 rounded-xl bg-card border border-border">
+      <div className="flex items-center gap-2">
+        {STAGES.map((s, i) => (
+          <div key={s} className="flex items-center gap-2 flex-1">
+            <span className={`text-[10px] px-2 py-1 rounded-full whitespace-nowrap border ${
+              i < idx || (stage === 'Completion' && i <= idx) ? 'border-green-500/30 text-green-400 bg-green-500/10'
+              : i === idx ? 'border-amber/40 text-amber bg-amber/10'
+              : 'border-border text-dim'
+            }`}>{s}</span>
+            {i < STAGES.length - 1 && <div className="flex-1 h-px bg-border" />}
+          </div>
+        ))}
+        {controlState === 'paused' && (
+          <span className="text-[10px] px-2 py-1 rounded-full whitespace-nowrap border border-amber/40 text-amber bg-amber/10 flex-shrink-0">⏸ Paused</span>
+        )}
+        {controlState === 'stopped' && (
+          <span className="text-[10px] px-2 py-1 rounded-full whitespace-nowrap border border-red-500/40 text-red-400 bg-red-500/10 flex-shrink-0">⏹ Stopped</span>
+        )}
+      </div>
+      <div className="flex items-center justify-between mt-1.5">
+        {last?.detail ? <p className="text-[10px] text-dim">{last.detail}</p> : <span />}
+      </div>
+    </div>
+  )
+}
+
+function GenerationControls({ stage, controlState, onPause, onResume, onStop }) {
+  // Only meaningful once a run is actually in flight and hasn't been stopped.
+  if (!stage || stage === 'Completion' || controlState === 'stopped') return null
+  return (
+    <div className="flex-shrink-0 mx-6 mt-3">
+      <div className="flex items-center gap-2">
+        {controlState === 'paused' ? (
+          <button onClick={onResume}
+            title="Copies a reminder to your clipboard — paste it into the existing Claude Desktop chat to actually get it moving again."
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-green-500/40 text-green-400 hover:bg-green-500/10 transition-all">
+            ▶ Resume
+          </button>
+        ) : (
+          <button onClick={onPause}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-amber/40 text-amber hover:bg-amber/10 transition-all">
+            ⏸ Pause
+          </button>
+        )}
+        <button onClick={() => { if (confirm("Stop generation? Test cases already saved before this point are kept and available in Load Results. Any batch Claude is mid-generating right now will be rejected when it tries to save — it will not be recovered.")) onStop() }}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-red-500/40 text-red-400 hover:bg-red-500/10 transition-all">
+          ⏹ Stop
+        </button>
+      </div>
+      {controlState === 'paused' && (
+        <p className="text-[10px] text-dim mt-1.5">
+          A reminder was copied to your clipboard — paste it into the Claude Desktop chat that's running this generation so it actually retries, since pausing here can't reach into its already-running turn.
+        </p>
+      )}
+    </div>
+  )
+}
+
+function ErrorBanner({ wsError, onDismiss }) {
+  if (!wsError) return null
+  return (
+    <div className="flex-shrink-0 mx-6 mt-3 px-4 py-2.5 rounded-xl bg-red-500/5 border border-red-500/30 flex items-start justify-between gap-3">
+      <p className="text-xs text-red-400">{wsError.message}</p>
+      <button onClick={onDismiss} className="text-[10px] text-dim hover:text-red-400 flex-shrink-0">Dismiss</button>
+    </div>
+  )
+}
+
+function ClarificationBanner({ clarification, onAnswer }) {
+  const [answer, setAnswer]         = useState('')
+  const [showFreeText, setShowFreeText] = useState(false)
+
+  useEffect(() => { setAnswer(''); setShowFreeText(false) }, [clarification])
+
+  if (!clarification) return null
+  const { question, options } = clarification
+  const submitFreeText = () => { if (answer.trim()) onAnswer(answer.trim()) }
+
+  return (
+    <div className="flex-shrink-0 mx-6 mt-3 px-4 py-3 rounded-xl bg-blue-500/5 border border-blue-500/30">
+      <p className="text-xs text-blue-400 font-medium mb-2">Claude needs clarification</p>
+      <p className="text-xs text-text mb-3">{question}</p>
+
+      {Array.isArray(options) && options.length > 0 && !showFreeText && (
+        <div className="flex flex-col gap-1.5 mb-2">
+          {options.map((opt, i) => (
+            <button
+              key={i}
+              onClick={() => onAnswer(opt)}
+              className="flex items-center gap-2.5 text-left text-xs px-3 py-2 rounded-lg border border-border bg-bg hover:border-blue-500/40 hover:bg-blue-500/5 transition-all"
+            >
+              <span className="flex-shrink-0 w-4 h-4 flex items-center justify-center text-[10px] rounded bg-card border border-border text-dim">
+                {i + 1}
+              </span>
+              {opt}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {(showFreeText || !options?.length) ? (
+        <div className="flex gap-2">
+          <input
+            autoFocus
+            value={answer}
+            onChange={e => setAnswer(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submitFreeText()}
+            placeholder="Type your answer…"
+            className="flex-1 text-xs px-3 py-1.5 rounded-lg bg-bg border border-border focus:border-blue-500/50 outline-none"
+          />
+          <button onClick={submitFreeText}
+            className="text-xs px-3 py-1.5 rounded-lg bg-blue-500 text-white font-medium hover:bg-blue-600 transition-all">
+            Send
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-3">
+          <button onClick={() => setShowFreeText(true)}
+            className="text-[11px] text-dim hover:text-blue-400 transition-colors underline">
+            Something else
+          </button>
+          <button onClick={() => onAnswer('(user chose to skip — proceed using your best judgement)')}
+            className="text-[11px] text-dim hover:text-text transition-colors underline">
+            Skip
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function PageGenerate({
   testCases, summary, generating, progress, error, aiWaiting,
   uploadDone, onGenerate, onClaudeGenerate, onRemindClaude,
   onLoadMcp, mcpAvailable, mcpResults, onExport,
+  stage, activityLog = [], requestId, clarification, onAnswerClarification,
+  wsError, onDismissError,
+  controlState = 'running', onPause, onResume, onStop,
 }) {
   const dupCount = summary?.duplicates_removed ?? 0
   const [showPreview,  setShowPreview]  = useState(true)
@@ -438,8 +580,14 @@ function PageGenerate({
         </div>
       )}
 
-      {/* AI waiting */}
-      {aiWaiting && (
+      {/* Live processing status, pushed over the WebSocket layer */}
+      <StageStepper stage={stage} activityLog={activityLog} requestId={requestId} controlState={controlState} />
+      <GenerationControls stage={stage} controlState={controlState} onPause={onPause} onResume={onResume} onStop={onStop} />
+      <ErrorBanner wsError={wsError} onDismiss={onDismissError} />
+      <ClarificationBanner clarification={clarification} onAnswer={onAnswerClarification} />
+
+      {/* AI waiting (shown until the first real status event arrives) */}
+      {aiWaiting && !stage && (
         <div className="flex-shrink-0 mx-6 mt-3 px-4 py-3 rounded-xl bg-amber/5 border border-amber/20 flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-amber border-t-transparent rounded-full spin flex-shrink-0" />
           <div className="flex-1">
@@ -540,6 +688,98 @@ function PageGenerate({
   )
 }
 
+// ─── Coverage gap report ────────────────────────────────────────────────────
+// Surfaces GET /api/coverage/report — the deterministic (non-AI) check added
+// alongside output_validator.check_coverage: MC/DC signal pairing, missing
+// baselines, broken dependency links, empty expected_outcome. This is a
+// floor, not a substitute for engineering review — it can only flag gaps in
+// test cases that were generated, not requirement behaviour nobody wrote a
+// test case for at all.
+function CoveragePanel({ hasResults, refreshKey }) {
+  const [report,   setReport]   = useState(null)
+  const [loading,  setLoading]  = useState(false)
+  const [expanded, setExpanded] = useState(false)
+
+  useEffect(() => {
+    if (!hasResults) { setReport(null); return }
+    setLoading(true)
+    fetch('/api/coverage/report')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setReport(d?.available ? d.report : null))
+      .catch(() => setReport(null))
+      .finally(() => setLoading(false))
+  }, [hasResults, refreshKey])
+
+  if (!hasResults) return null
+
+  return (
+    <div className="mb-6 rounded-2xl border border-border bg-card p-5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-text">Coverage Gap Report</p>
+          <p className="text-xs text-dim mt-0.5">
+            Deterministic check — MC/DC pairing, baselines, dependency links, empty outcomes.
+            Not a substitute for engineering review.
+          </p>
+        </div>
+        {loading && <div className="w-4 h-4 border-2 border-amber border-t-transparent rounded-full spin flex-shrink-0" />}
+      </div>
+
+      {report && (
+        <div className="mt-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="rounded-xl p-3 border border-border bg-bg">
+              <p className="text-xl font-semibold text-text">{report.total_requirement_groups}</p>
+              <p className="text-[11px] text-dim mt-0.5">Test case groups</p>
+            </div>
+            <div className={`rounded-xl p-3 border ${report.groups_with_gaps > 0 ? 'bg-red-500/8 border-red-500/30' : 'bg-green-500/8 border-green-500/30'}`}>
+              <p className={`text-xl font-semibold ${report.groups_with_gaps > 0 ? 'text-red-400' : 'text-green-400'}`}>{report.groups_with_gaps}</p>
+              <p className="text-[11px] text-dim mt-0.5">Groups with gaps</p>
+            </div>
+            <div className="rounded-xl p-3 border border-border bg-bg">
+              <p className="text-xl font-semibold text-text">{report.groups_clean}</p>
+              <p className="text-[11px] text-dim mt-0.5">Clean groups</p>
+            </div>
+            <div className="rounded-xl p-3 border border-border bg-bg">
+              <p className="text-xl font-semibold text-text">{report.total_gaps}</p>
+              <p className="text-[11px] text-dim mt-0.5">Total gaps</p>
+            </div>
+          </div>
+
+          {report.total_gaps > 0 && (
+            <>
+              <div className="flex flex-wrap gap-2 mt-4">
+                {Object.entries(report.gaps_by_category).map(([cat, count]) => (
+                  <span key={cat}
+                    className="text-[10px] px-2 py-1 rounded-full bg-red-500/10 border border-red-500/25 text-red-400 font-mono">
+                    {cat.replace(/_/g, ' ')}: {count}
+                  </span>
+                ))}
+              </div>
+
+              <button onClick={() => setExpanded(e => !e)}
+                className="mt-3 text-xs text-amber underline hover:no-underline">
+                {expanded ? 'Hide details' : `Show ${report.total_gaps} gap details`}
+              </button>
+
+              {expanded && (
+                <div className="mt-3 max-h-64 overflow-auto rounded-lg border border-border divide-y divide-border">
+                  {report.gap_details.map((g, i) => (
+                    <div key={i} className="p-3 text-xs">
+                      <p className="font-mono text-dim">{g.traceability_req_id} · {g.test_case_id} · {g.category.replace(/_/g, ' ')}</p>
+                      <p className="text-text mt-1">{g.detail}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function PageExport({ testCases, summary, sessionId, exportSource }) {
   const dupCount = summary?.duplicates_removed ?? 0
   const hasResults = testCases.length > 0
@@ -559,6 +799,8 @@ function PageExport({ testCases, summary, sessionId, exportSource }) {
         </div>
       ) : (
         <>
+          <CoveragePanel hasResults={hasResults} refreshKey={testCases.length} />
+
           {/* Summary stats */}
           {summary && (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
@@ -579,6 +821,78 @@ function PageExport({ testCases, summary, sessionId, exportSource }) {
               ))}
             </div>
           )}
+
+          {/* Verification depth — code-computed scenario-type diversity per
+              requirement, independent of whatever Claude's own RTM/testability
+              summary claims. Falls back to a client-side computation from
+              testCases if this summary predates the backend field. */}
+          {summary && (() => {
+            const CORE = ['normal', 'boundary', 'edge', 'robustness']
+            const ADV_LABELS = { mcdc: 'MC/DC', beyond_range: 'Beyond-Range', fault: 'Fault Injection', timing: 'Timing' }
+            let depth = summary.verification_depth
+            if (!depth) {
+              const byReq = {}
+              for (const tc of (testCases || [])) {
+                const rid = tc.traceability_req_id
+                const st  = (tc.scenario_type || '').toLowerCase().trim()
+                if (rid && st) (byReq[rid] ||= new Set()).add(st)
+              }
+              const gaps = {}
+              const advUsage = {}
+              for (const [rid, types] of Object.entries(byReq)) {
+                const missing = CORE.filter(c => !types.has(c))
+                if (missing.length) gaps[rid] = missing
+                for (const k of Object.keys(ADV_LABELS)) if (types.has(k)) advUsage[k] = (advUsage[k] || 0) + 1
+              }
+              depth = { core_scenario_gaps: gaps, advanced_scenario_usage: advUsage }
+            }
+            const gapEntries = Object.entries(depth.core_scenario_gaps || {})
+            const advanced   = depth.advanced_scenario_usage || {}
+            const advTotal   = Object.values(advanced).reduce((a, b) => a + b, 0)
+            return (
+              <div className="rounded-xl p-4 border border-border bg-card mb-6 space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs text-dim uppercase tracking-widest font-mono">Verification Depth</p>
+                  <span className="text-[10px] text-dim">code-computed, not self-reported</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {gapEntries.length === 0 ? (
+                    <span className="text-xs px-2 py-1 rounded-full border border-green-500/30 text-green-400 bg-green-500/10">
+                      ✓ Every requirement has all 4 core scenario types
+                    </span>
+                  ) : (
+                    <span className="text-xs px-2 py-1 rounded-full border border-amber/40 text-amber bg-amber/10">
+                      ⚠ {gapEntries.length} requirement{gapEntries.length !== 1 ? 's' : ''} missing a core scenario type
+                    </span>
+                  )}
+                  {Object.keys(ADV_LABELS).map(k => advanced[k] ? (
+                    <span key={k} className={`text-xs font-mono px-2 py-1 rounded-full badge-${k}`}>
+                      {ADV_LABELS[k]} × {advanced[k]}
+                    </span>
+                  ) : null)}
+                  {advTotal === 0 && (
+                    <span className="text-xs px-2 py-1 rounded-full border border-border text-dim">
+                      No MC/DC, Beyond-Range, Fault, or Timing test cases in this run
+                    </span>
+                  )}
+                </div>
+                {gapEntries.length > 0 && (
+                  <details className="text-xs text-dim">
+                    <summary className="cursor-pointer hover:text-text">Show requirements with gaps ({gapEntries.length})</summary>
+                    <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                      {gapEntries.map(([rid, missing]) => (
+                        <div key={rid} className="flex items-center gap-2 font-mono">
+                          <span className="text-text">{rid}</span>
+                          <span className="text-dim">missing:</span>
+                          <span className="text-amber">{missing.join(', ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )
+          })()}
 
           {/* Download cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
@@ -657,20 +971,132 @@ export default function App() {
   const [aiWaiting,    setAiWaiting]    = useState(false)
   const [exportSource, setExportSource] = useState('session')
 
+  // Live status from the WebSocket layer: current stage, rolling activity log,
+  // any clarification question Claude Desktop is waiting on, the last error,
+  // and the request_id of the run currently being tracked.
+  const [stage,          setStage]          = useState(null)   // e.g. "Test Case Generation"
+  const [activityLog,    setActivityLog]    = useState([])     // [{ts, stage/answer, detail}]
+  const [clarification,  setClarification]  = useState(null)   // {question, options} | null
+  const [wsError,        setWsError]        = useState(null)   // {message} | null
+  const [requestId,      setRequestId]      = useState(null)
+  const [controlState,   setControlState]   = useState('running')  // running / paused / stopped
+
   useEffect(() => {
     fetch('/api/mode').then(r => r.ok ? r.json() : null).then(d => { if (d) setMode(d) }).catch(() => {})
   }, [])
 
+  // Reconcile with the real backend Job Status on load — the websocket
+  // 'control' event only fires on the *next* change, so a page reload/
+  // reconnect would otherwise silently default to 'running' even if the
+  // backend is actually PAUSED or STOPPED from before the reload.
+  useEffect(() => {
+    fetch('/api/job/status').then(r => r.ok ? r.json() : null).then(d => {
+      if (d?.job_status) setControlState(d.job_status.toLowerCase())
+    }).catch(() => {})
+  }, [])
+
+  const handleMcpResult = useCallback((data) => {
+    if (data && data.test_cases?.length > 0) {
+      setMcpAvailable(true); setMcpResults(data); setAiWaiting(false)
+    }
+  }, [])
+
+  // Real-time status/clarification/result channel. Falls back to the slower
+  // /api/mcp/latest poll below if the socket is ever down.
+  useEffect(() => {
+    let ws, reconnectTimer, alive = true
+
+    const connect = () => {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+      ws = new WebSocket(`${proto}://${location.host}/ws/status`)
+
+      ws.onmessage = (evt) => {
+        let msg
+        try { msg = JSON.parse(evt.data) } catch { return }
+        if (msg.request_id) setRequestId(msg.request_id)
+
+        if (msg.type === 'status') {
+          setStage(msg.stage)
+          setActivityLog(log => [...log.slice(-49), msg])
+          if (msg.stage && msg.stage !== 'Completion') setAiWaiting(true)
+        } else if (msg.type === 'control') {
+          setControlState(msg.state)
+          setActivityLog(log => [...log.slice(-49), msg])
+          if (msg.state === 'stopped') setAiWaiting(false)
+        } else if (msg.type === 'clarification_question') {
+          setClarification({ question: msg.question, options: msg.options || null })
+          setActivityLog(log => [...log.slice(-49), msg])
+        } else if (msg.type === 'user_response') {
+          setClarification(null)
+          setActivityLog(log => [...log.slice(-49), msg])
+        } else if (msg.type === 'result') {
+          handleMcpResult({ available: true, test_cases: msg.test_cases, summary: msg.summary })
+        } else if (msg.type === 'error') {
+          setWsError({ message: msg.message })
+          setActivityLog(log => [...log.slice(-49), msg])
+        }
+      }
+
+      ws.onclose = () => { if (alive) reconnectTimer = setTimeout(connect, 2000) }
+      ws.onerror = () => ws.close()
+    }
+
+    connect()
+    return () => { alive = false; clearTimeout(reconnectTimer); ws?.close() }
+  }, [handleMcpResult])
+
   useEffect(() => {
     const id = setInterval(() => {
-      fetch('/api/mcp/latest').then(r => r.ok ? r.json() : null).then(data => {
-        if (data?.available && data.test_cases?.length > 0) {
-          setMcpAvailable(true); setMcpResults(data); setAiWaiting(false)
-        }
-      }).catch(() => {})
-    }, 3000)
+      fetch('/api/mcp/latest').then(r => r.ok ? r.json() : null).then(handleMcpResult).catch(() => {})
+    }, 10000)  // low-frequency fallback only — WS carries the real-time updates
     return () => clearInterval(id)
+  }, [handleMcpResult])
+
+  const answerClarification = useCallback(async (answer) => {
+    try {
+      await fetch('/api/clarify/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer }),
+      })
+      setClarification(null)
+    } catch {}
   }, [])
+
+  // ── generation control: pause / resume / stop ────────────────────────────
+  // Optimistic local update for instant feedback; the 'control' WS event
+  // (broadcast by the backend once it's actually flipped the flag) reconciles
+  // this if anything raced. Actual enforcement happens server-side — these
+  // buttons make the backend refuse further batches/saves, they don't reach
+  // into Claude's live turn.
+  const pauseGeneration = useCallback(async () => {
+    setControlState('paused')
+    try { await fetch('/api/job/pause', { method: 'POST' }) } catch {}
+  }, [])
+
+  const resumeGeneration = useCallback(async () => {
+    setControlState('running')
+    try { await fetch('/api/job/resume', { method: 'POST' }) } catch {}
+    // Flipping the backend flag doesn't reach into Claude Desktop's already-running
+    // chat turn — Claude only sees "resumed" the next time it calls a tool, and it
+    // has no reason to call one on its own after being told to hold. Put the nudge
+    // on the clipboard so the user can paste it into the existing chat.
+    await navigator.clipboard.writeText(
+      'Generation has been resumed. Retry the save_enhanced_test_cases call that was just held, then continue with the remaining batches as before.'
+    ).catch(() => {})
+  }, [])
+
+  const stopGeneration = useCallback(async () => {
+    setControlState('stopped')
+    try {
+      const res  = await fetch('/api/job/stop', { method: 'POST' })
+      const data = await res.json()
+      if (data?.salvaged_test_cases > 0) {
+        // Pull whatever was salvaged into view immediately.
+        fetch('/api/mcp/latest').then(r => r.ok ? r.json() : null).then(handleMcpResult).catch(() => {})
+      }
+    } catch {}
+  }, [handleMcpResult])
 
   // ── upload ──────────────────────────────────────────────────────────────────
   const handleFile = useCallback(async (type, f) => {
@@ -770,7 +1196,7 @@ export default function App() {
 
   const handleClaudeGenerate = async () => {
     if (!uploadData?.session_id) return
-    setError(''); setTestCases([]); setSummary(null)
+    setError(''); setTestCases([]); setSummary(null); setControlState('running')
     try {
       const qRes = await fetch('/api/generate/ai', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -990,7 +1416,12 @@ export default function App() {
               onRemindClaude={handleRemindClaude}
               onLoadMcp={handleLoadMcp}
               mcpAvailable={mcpAvailable} mcpResults={mcpResults}
-              onExport={() => setTab('export')} 
+              onExport={() => setTab('export')}
+              stage={stage} activityLog={activityLog} requestId={requestId}
+              clarification={clarification} onAnswerClarification={answerClarification}
+              wsError={wsError} onDismissError={() => setWsError(null)}
+              controlState={controlState} onPause={pauseGeneration}
+              onResume={resumeGeneration} onStop={stopGeneration}
             />
           </div>
         )}

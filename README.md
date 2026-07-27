@@ -108,15 +108,57 @@ Then run the frontend separately with `npm run dev`.
 
 ---
 
-## API Endpoints
+## Document/Chunk Caching (content-hash based)
+
+To avoid re-parsing and re-ingesting a document you've already processed —
+including across app restarts — the backend keeps a persistent, content-hash
+cache in `backend/.cache/`:
+
+| Cache | Keyed by | Skips |
+|-------|----------|-------|
+| `backend/.cache/text/*.json` | SHA-256 of the raw uploaded file bytes | `parse_file()` — PDF/DOCX/XLSX text extraction |
+| `backend/.cache/chunks/*.json` | SHA-256 of parsed text + chunk size + `CACHE_FORMAT_VERSION` | `ingest_document()` — sentence/requirement chunking |
+
+Both `/api/generate` (rule-based) and `/api/generate/ai` (Claude AI / MCP)
+route through a shared `_ingest_with_cache()` helper in `main.py`, so a cache
+hit benefits either path.
+
+**Multi-document batching:** `/api/generate/ai` accepts either
+`{"session_id": "..."}` (single document, original behavior) or
+`{"session_ids": ["...", "...", "..."]}` — the latter merges requirement
+chunks from every listed upload session into one combined queue before Claude
+AI batches through it via `get_generated_test_cases`. Each queued entry is
+tagged with `source_session_id` / `source_filename` for traceability.
+
+**Cache lifetime & invalidation:**
+- Survives process restarts and EXE rebuilds (`refresh.bat`, `build_exe.bat`,
+  including "Full clean rebuild") — the cache lives under `backend/.cache/`,
+  which none of those touch.
+- Does **not** survive deleting/reinstalling the whole app folder, since
+  `.cache/` is nested inside it. Point `_CACHE_DIR` in `doc_cache.py` at a
+  location outside the app folder if you need it to survive a full reinstall.
+- If you change `document_ingestion.py`'s logic (new regex, new module
+  rules, etc.) or `CHUNK_SIZE_WORDS`, bump `CACHE_FORMAT_VERSION` in
+  `doc_cache.py` (or call `POST /api/debug/cache/clear`) so stale cached
+  chunks aren't served under the old logic.
+- What does **not** persist across a restart regardless of caching: the
+  in-memory `sessions` / `generation_queue` dicts (your upload → session_id
+  mapping). Re-upload the same file through the GUI after a restart — the
+  parse/ingest work itself will be skipped via the cache, but you'll get a
+  fresh `session_id`.
+
+---
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/upload` | Upload SRS file |
-| POST | `/api/generate` | Generate test cases |
+| POST | `/api/upload` | Upload SRS file (content-hash cached — see above) |
+| POST | `/api/generate` | Generate test cases (rule-based, uses cached ingestion) |
+| POST | `/api/generate/ai` | Queue requirements for Claude AI/MCP — accepts `session_id` or `session_ids: [...]` for multi-document batching |
 | GET | `/api/export/excel?session_id=` | Download `.xlsx` |
 | GET | `/api/export/docx?session_id=` | Download `.docx` |
 | GET | `/api/health` | Health check |
+| GET | `/api/debug/cache` | Show count of cached documents/chunk-sets |
+| POST | `/api/debug/cache/clear` | Wipe the on-disk text/chunk cache |
 
 ---
 
@@ -131,6 +173,7 @@ ai-testcase-tool/
 │   ├── config.py             # Config (no API key)
 │   ├── file_parser.py        # PDF / DOCX / XLSX parsing
 │   ├── document_ingestion.py # Chunking + classification
+│   ├── doc_cache.py          # Content-hash cache for parsed text + chunks
 │   ├── test_case_generator.py# Rule-based NLP engine
 │   ├── output_generator.py   # Excel + Word export
 │   └── requirements.txt

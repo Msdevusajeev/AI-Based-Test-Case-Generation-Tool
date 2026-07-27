@@ -11,9 +11,11 @@ import webbrowser
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+import asyncio
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -40,9 +42,10 @@ from models import (
 from config import ENGINE, VERSION, CHUNK_SIZE_WORDS, MCP_ENABLED
 from file_parser import parse_file
 from document_ingestion import ingest_document
+import doc_cache
 from output_validator   import validate_test_cases
 from test_case_generator import generate_all, is_spacy_available
-from output_generator import generate_excel, generate_docx
+from output_generator import generate_excel, generate_docx, compute_gui_display_fields
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +74,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── WEBSOCKET STATUS LAYER ───────────────────────────────────────────────────
+# Pushes processing-status events, clarification questions, and final results to
+# the React UI in real time. Replaces the old 3s-poll pattern for these events;
+# /api/mcp/latest and /api/tokens/usage are left in place as a fallback.
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+
+manager = ConnectionManager()
+
+
+async def _emit(event_type: str, **payload):
+    """Append to the activity log and push to every connected GUI client.
+    Every event is stamped with request_id = the current session_id, so the
+    GUI (and anyone inspecting the log) can tell which run an event belongs
+    to even if a second run starts before the first one's events finish
+    displaying."""
+    entry = {
+        "type": event_type,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "request_id": generation_queue.get("session_id"),
+        **payload,
+    }
+    generation_queue.setdefault("activity_log", []).append(entry)
+    generation_queue["activity_log"] = generation_queue["activity_log"][-100:]  # cap
+    await manager.broadcast(entry)
+
+
+@app.websocket("/ws/status")
+async def ws_status(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        # Replay recent history so a client that connects mid-run isn't blind.
+        for entry in generation_queue.get("activity_log", [])[-20:]:
+            await websocket.send_json(entry)
+        while True:
+            # We don't expect the GUI to push data over this socket except a
+            # ping; clarification answers go through the plain HTTP endpoint
+            # below so they're logged/validated the same way any POST is.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
 # ─── SESSION STORE ────────────────────────────────────────────────────────────
 # In-memory store: session_id → { filename, doc_type, text, chunks, test_cases, removed }
 sessions: Dict[str, Dict[str, Any]] = {}
@@ -97,15 +163,39 @@ token_usage: Dict[str, Any] = {
     "calls_made":       0,
 }
 
+def _ingest_with_cache(text: str, chunk_size_words: int):
+    """
+    Wraps ingest_document() with a persistent content-hash cache so an
+    identical document (same text + same chunk size) is never re-ingested.
+    Returns (chunks, text_hash, was_cached).
+    """
+    text_hash = doc_cache.hash_text(text)
+    cached    = doc_cache.get_cached_chunks(text_hash, chunk_size_words)
+    if cached is not None:
+        logger.info(f"[CACHE HIT] ingest — text_hash={text_hash[:12]}…, skipped ingest_document ({len(cached)} chunks reused)")
+        return cached, text_hash, True
+
+    chunks = ingest_document(text, chunk_size_words)
+    doc_cache.set_cached_chunks(text_hash, chunk_size_words, chunks)
+    return chunks, text_hash, False
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate using ~4 chars/token heuristic (Claude-family average)."""
     return max(1, len(text) // 4)
 
 
 generation_queue: Dict[str, Any] = {
-    "chunks":     [],
-    "session_id": None,
-    "status":     "idle",   # idle / queued / complete
+    "chunks":      [],
+    "session_id":  None,
+    "session_ids": [],       # populated when /api/generate/ai batches multiple documents
+    "status":      "idle",   # idle / queued / analysis / generating / clarifying / complete
+    "job_status": "RUNNING",  # RUNNING / PAUSED / STOPPED — user-driven Pause/Stop state,
+                               # independent of "status" above. This is what the
+                               # generation loop (fetch + save endpoints) checks
+                               # before doing any further work.
+    "activity_log": [],     # rolling log of status events, pushed over /ws/status
+    "pending_clarification": None,  # {"question": str, "answer": str|None}
 }
 
 
@@ -182,6 +272,75 @@ def _merge_test_cases(existing, incoming) -> list:
     return merged
 
 
+# ─── GUI DISPLAY FIELD ATTACHMENT ─────────────────────────────────────────────
+# mcp_results_store holds plain dicts (not TestCase objects — see
+# output_validator.ValidationReport.valid_test_cases), and both the
+# websocket "result" event and GET /api/mcp/latest send those dicts straight
+# to the GUI as-is. The GUI must not re-derive Test Details Description (or
+# the other narrative columns) itself — that duplicate JS logic in
+# TCTable.jsx/ResultsTable.jsx is what drifted from the Excel/Word export in
+# the first place. Instead, attach the backend-computed text to the dict
+# here, right before it is stored/broadcast, using the exact same functions
+# generate_excel/generate_docx use.
+_TC_DEFAULTS = {
+    "traceability_req_id": "", "test_case_id": "", "scenario_id": "",
+    "priority": "P2", "objective": "", "preconditions": [],
+    "test_steps": [], "inputs": [], "design_methodology": "Equivalence Partitioning",
+    "dependent_test_cases": "None", "expected_outcome": "",
+    "test_environment": "Dev", "remarks": "", "module": "General",
+    "requirement_type": "functional", "scenario_type": "normal",
+    "testing_type": "verification",
+}
+
+def _attach_display_fields(raw: dict, siblings: Optional[list] = None) -> dict:
+    """Computes test_details_description (+ the other display columns) for a
+    raw MCP test-case dict and merges them in-place. Never drops or
+    overwrites the caller's original fields — only adds the derived ones.
+
+    `siblings` — TestCase objects for every test case in the same batch —
+    lets MC/DC (boundary) rows identify which signal is actually being
+    isolated in this specific row instead of always naming the first
+    declared input(s); see output_generator._description_signal_names.
+    """
+    from models import TestCase as _TestCase
+    merged = {**_TC_DEFAULTS, **{k: v for k, v in raw.items() if k in _TC_DEFAULTS}}
+    try:
+        tc_obj = _TestCase(**merged)
+        raw.update(compute_gui_display_fields(tc_obj, siblings=siblings))
+    except Exception:
+        logger.warning(
+            f"Could not compute GUI display fields for "
+            f"{raw.get('test_case_id', '?')}: {traceback.format_exc()}"
+        )
+    return raw
+
+
+def _attach_display_fields_all(test_cases: list) -> list:
+    """Builds a TestCase object for every raw dict once (so each row can see
+    its siblings for MC/DC signal detection), then attaches the computed
+    display fields to each original dict."""
+    from models import TestCase as _TestCase
+    tc_objs = []
+    for raw in test_cases:
+        merged = {**_TC_DEFAULTS, **{k: v for k, v in raw.items() if k in _TC_DEFAULTS}}
+        try:
+            tc_objs.append(_TestCase(**merged))
+        except Exception:
+            tc_objs.append(None)
+    for raw, tc_obj in zip(test_cases, tc_objs):
+        if tc_obj is None:
+            continue
+        siblings = [o for o in tc_objs if o is not None]
+        try:
+            raw.update(compute_gui_display_fields(tc_obj, siblings=siblings))
+        except Exception:
+            logger.warning(
+                f"Could not compute GUI display fields for "
+                f"{raw.get('test_case_id', '?')}: {traceback.format_exc()}"
+            )
+    return test_cases
+
+
 # ─── MCP RESULT NORMALISER ────────────────────────────────────────────────────
 
 def _normalise_mcp_tc(raw: dict) -> dict:
@@ -209,7 +368,6 @@ def _normalise_mcp_tc(raw: dict) -> dict:
         "test_methodology":    "design_methodology",
         "dependent":           "dependent_test_cases",
         "depends_on":          "dependent_test_cases",
-        "depands_on":          "dependent_test_cases",
         "expected":            "expected_outcome",
         "expected_result":     "expected_outcome",
         "environment":         "test_environment",
@@ -318,6 +476,20 @@ def _error(error: str, layer: str, detail: str, suggestion: str, status: int = 5
 
 # ─── HEALTH ───────────────────────────────────────────────────────────────────
 
+@app.get("/api/debug/cache")
+def debug_cache():
+    """Shows how many documents/chunk-sets are currently cached on disk."""
+    return doc_cache.cache_stats()
+
+
+@app.post("/api/debug/cache/clear")
+def debug_cache_clear():
+    """Wipes the on-disk text/chunk caches. Use after a genuine ingestion-logic
+    change if you forgot to bump doc_cache.CACHE_FORMAT_VERSION."""
+    doc_cache.clear_cache()
+    return {"status": "cleared"}
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health():
     return HealthResponse(
@@ -381,43 +553,56 @@ async def upload(file: UploadFile = File(...), doc_type: str = "srs"):
     doc_type: 'srs' | 'icd' | 'supporting'
     All uploaded texts are merged for generation; SRS requirements drive TC_IDs.
     """
-    allowed = {".pdf", ".docx", ".doc", ".xlsx", ".xls"}
+    allowed = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt"}
     suffix  = f".{file.filename.lower().rsplit('.', 1)[-1]}" if "." in file.filename else ""
     if suffix not in allowed:
         _error(
             "Unsupported file type",
             "parsing",
             f"Received: {suffix}",
-            "Upload a .pdf, .docx, or .xlsx file",
+            "Upload a .pdf, .docx, .xlsx, or .txt file",
             400,
         )
 
-    try:
-        raw_bytes = await file.read()
-        text      = parse_file(file.filename, raw_bytes)
-    except Exception as e:
-        _error(
-            "File parsing failed",
-            "parsing",
-            traceback.format_exc(),
-            "Re-upload the file. PDF may be password-protected or empty.",
-            422,
-        )
+    raw_bytes = await file.read()
+    file_hash = doc_cache.hash_bytes(raw_bytes)
 
-    if not text or len(text.strip()) < 50:
-        _error(
-            "Document appears empty",
-            "parsing",
-            "Extracted text is too short",
-            "Ensure the document has readable text content.",
-            422,
-        )
+    # ── Content-hash cache lookup: skip re-parsing an identical file ────────
+    cached_text = doc_cache.get_cached_text(file_hash)
+    from_cache  = cached_text is not None
+
+    if from_cache:
+        text = cached_text
+        logger.info(f"[CACHE HIT] upload — {file.filename} matches file_hash={file_hash[:12]}…, skipped parse_file")
+    else:
+        try:
+            text = parse_file(file.filename, raw_bytes)
+        except Exception:
+            _error(
+                "File parsing failed",
+                "parsing",
+                traceback.format_exc(),
+                "Re-upload the file. PDF may be password-protected or empty.",
+                422,
+            )
+
+        if not text or len(text.strip()) < 50:
+            _error(
+                "Document appears empty",
+                "parsing",
+                "Extracted text is too short",
+                "Ensure the document has readable text content.",
+                422,
+            )
+
+        doc_cache.set_cached_text(file_hash, file.filename, text)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = {
         "filename":   file.filename,
         "doc_type":   doc_type,
         "text":       text,
+        "file_hash":  file_hash,
         "chunks":     None,
         "test_cases": None,
         "removed":    0,
@@ -522,7 +707,7 @@ def generate(request: GenerateRequest):
 
         # Ingest SRS ONLY — ICD/supporting text contains identifiers that
         # confuse the parser and create phantom requirement chunks.
-        chunks = ingest_document(text, CHUNK_SIZE_WORDS)
+        chunks, _text_hash, _was_cached = _ingest_with_cache(text, CHUNK_SIZE_WORDS)
 
         # ── Requirement ID prefix filter (rule-based) ────────────────────────
         req_prefixes = getattr(request, "req_prefixes", None) or []
@@ -579,6 +764,7 @@ def generate(request: GenerateRequest):
             "rp3": rp.rp3,
             "rp4": rp.rp4,
             "rp5": rp.rp5,
+            "rp6": rp.rp6,
         }
 
         # Rule-based engine ONLY — Claude AI uses /api/generate/ai (separate endpoint)
@@ -598,6 +784,13 @@ def generate(request: GenerateRequest):
                 "Verify SRS language uses shall/must/should.",
                 422,
             )
+
+        # Attach Test Details Description etc. so the GUI (if it ever renders
+        # rule-engine results directly) shows the same text as the Excel/Word
+        # export instead of re-deriving it with stale JS logic.
+        for tc in test_cases:
+            for field_name, value in compute_gui_display_fields(tc, siblings=test_cases).items():
+                setattr(tc, field_name, value)
 
         sessions[request.session_id]["chunks"]     = chunks
         sessions[request.session_id]["test_cases"] = test_cases
@@ -844,12 +1037,19 @@ async def generate_ai(request: Request):
         data       = await request.json()
         session_id = data.get("session_id")
 
+        # ── Multi-document support ─────────────────────────────────────────
+        # Accept EITHER a single "session_id" (existing behaviour, unchanged)
+        # OR a "session_ids" list, to batch requirements across every document
+        # queued so far in one pass. Falls back to [session_id] when absent.
+        session_ids = data.get("session_ids") or ([session_id] if session_id else [])
+        session_ids = [sid for sid in session_ids if sid]
+
         # ── DEBUG: store and log incoming payload ─────────────────────────
         _last_ai_request.clear()
         _last_ai_request.update({
             "keys":                   list(data.keys()),
             "req_prefixes":           data.get("req_prefixes"),
-            "session_id":             session_id,
+            "session_ids":            session_ids,
             "selected_module":        data.get("selected_module"),
             "selected_modules_count": len(data.get("selected_modules") or []),
             "selected_modules_sample":(data.get("selected_modules") or [])[:3],
@@ -858,19 +1058,21 @@ async def generate_ai(request: Request):
             f"[AI-ENDPOINT] incoming keys={list(data.keys())} | "
             f"req_prefixes={data.get('req_prefixes')!r} | "
             f"selected_req_ids={data.get('selected_req_ids')!r} | "
-            f"session_id={session_id!r}"
+            f"session_ids={session_ids!r}"
         )
         # ─────────────────────────────────────────────────────────────────
 
-        if not session_id:
-            raise HTTPException(status_code=400, detail="session_id is required")
+        if not session_ids:
+            raise HTTPException(status_code=400, detail="session_id or session_ids is required")
 
-        session = sessions.get(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found. Upload a file first.")
+        missing = [sid for sid in session_ids if sid not in sessions]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Session(s) not found: {missing}. Upload the file(s) first.")
 
-        text = session["text"]
-
+        # ── Optional ICD/supporting context, applied against the first
+        # session in the batch (kept for backward compatibility with the
+        # single-document ICD-merge flow; multi-doc batching does not
+        # currently fan this out to every session). ──────────────────────
         icd_text = ""
         icd_session_id = data.get("icd_session_id")
         if icd_session_id and icd_session_id in sessions:
@@ -881,56 +1083,83 @@ async def generate_ai(request: Request):
         if supporting_session_id and supporting_session_id in sessions:
             supporting_text = sessions[supporting_session_id].get("text", "")
 
-        combined_text = text
-        if icd_text:
-            combined_text += f"\n\n[ICD_DOCUMENT_START]\n{icd_text}\n[ICD_DOCUMENT_END]"
-        if supporting_text:
-            combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
+        if icd_text or supporting_text:
+            logger.info(
+                f"[AI-ENDPOINT] ICD/supporting context attached "
+                f"(icd={bool(icd_text)}, supporting={bool(supporting_text)}) — "
+                f"note: informational only, not yet merged into ingestion for "
+                f"multi-document batches"
+            )
 
-        # Ingest SRS ONLY — ICD/supporting text contains identifiers that
-        # confuse the parser and create phantom requirement chunks.
-        chunks = ingest_document(text, CHUNK_SIZE_WORDS)
-
-        # ── Scope filter for Claude AI (same logic as rule-based) ─────────────
+        # ── Scope filter params (same for every document in the batch) ──────
         selected_req_ids = data.get("selected_req_ids")   # list or None
         selected_module  = data.get("selected_module")    # str or None
         selected_modules = data.get("selected_modules")   # list or None
+        req_prefixes     = [p.strip() for p in (data.get("req_prefixes") or []) if p.strip()]
 
-        # ── Requirement ID prefix filter ─────────────────────────────────
-        req_prefixes = data.get("req_prefixes") or []
-        if req_prefixes:
-            prefixes = [p.strip() for p in req_prefixes if p.strip()]
-            if prefixes:
+        chunk_data   = []   # merged, across every document in session_ids
+        all_chunks   = {}   # session_id -> chunks, so each session keeps its own for reference
+        cache_hits   = 0
+
+        for sid in session_ids:
+            session  = sessions[sid]
+            text     = session["text"]
+            filename = session.get("filename", sid)
+
+            # Ingest SRS ONLY (cached by content hash — identical documents,
+            # even across different upload sessions, are never re-ingested).
+            # ICD/supporting text is deliberately excluded here — it contains
+            # identifiers that confuse the parser and create phantom chunks.
+            chunks, _text_hash, was_cached = _ingest_with_cache(text, CHUNK_SIZE_WORDS)
+            if was_cached:
+                cache_hits += 1
+
+            # ── Requirement ID prefix filter ─────────────────────────────
+            if req_prefixes:
                 before_pf = len(chunks)
                 chunks = [c for c in chunks
                           if c.requirement_ids and
-                          any(c.requirement_ids[0].startswith(px) for px in prefixes)]
-                logger.info(f"[PREFIX/AI] {prefixes} → {before_pf} → {len(chunks)} chunks")
-        # ─────────────────────────────────────────────────────────────────
+                          any(c.requirement_ids[0].startswith(px) for px in req_prefixes)]
+                logger.info(f"[PREFIX/AI] {filename} — {req_prefixes} → {before_pf} → {len(chunks)} chunks")
 
-        logger.info(f"[SCOPE/AI] selected_req_ids={selected_req_ids!r}  "
-                    f"selected_module={selected_module!r}  "
-                    f"total_chunks={len(chunks)}")
+            if selected_req_ids is not None:
+                keep   = set(selected_req_ids)
+                before = len(chunks)
+                chunks = [c for c in chunks
+                          if any(rid in keep for rid in (c.requirement_ids or []))]
+                logger.info(f"[SCOPE/AI] {filename} — req filter → {before} → {len(chunks)} chunks")
+            elif (selected_modules or selected_module) and selected_module != "__all__":
+                mods = set(selected_modules or [])
+                if selected_module and selected_module not in mods:
+                    mods.add(selected_module)
+                before = len(chunks)
+                chunks = [c for c in chunks if (c.module or "General") in mods]
+                logger.info(f"[SCOPE/AI] {filename} — module filter {mods} → {before} → {len(chunks)} chunks")
+            else:
+                logger.info(f"[SCOPE/AI] {filename} — no filter — queuing all {len(chunks)} chunks")
 
-        if selected_req_ids is not None:
-            keep   = set(selected_req_ids)
-            before = len(chunks)
-            # Keep chunk if ANY of its requirement IDs is in the selected set
-            chunks = [c for c in chunks
-                      if any(rid in keep for rid in (c.requirement_ids or []))]
-            logger.info(f"[SCOPE/AI] req filter → {before} → {len(chunks)} chunks | keep={keep}")
-        elif (selected_modules or selected_module) and selected_module != "__all__":
-            mods = set(selected_modules or [])
-            if selected_module and selected_module not in mods:
-                mods.add(selected_module)
-            before = len(chunks)
-            chunks = [c for c in chunks if (c.module or "General") in mods]
-            logger.info(f"[SCOPE/AI] module filter {mods} → {before} → {len(chunks)} chunks")
-        else:
-            logger.info(f"[SCOPE/AI] no filter — queuing all {len(chunks)} chunks")
-        # ─────────────────────────────────────────────────────────────────────
+            all_chunks[sid] = chunks
+            sessions[sid]["chunks"] = chunks
 
-        if not chunks:
+            # Expand: one entry per requirement ID so Claude gets context for
+            # EVERY requirement even when multiple reqs share the same chunk.
+            for c in chunks:
+                req_id = c.requirement_ids[0] if c.requirement_ids else "REQ-001"
+                chunk_data.append({
+                    "requirement_id":   req_id,
+                    "content":          c.content,
+                    "module":           c.module or "General",
+                    "requirement_type": c.requirement_type,
+                    "source_session_id": sid,
+                    "source_filename":   filename,
+                })
+
+        logger.info(
+            f"[AI-ENDPOINT] merged {len(session_ids)} document(s) → "
+            f"{len(chunk_data)} requirement(s) queued | cache_hits={cache_hits}/{len(session_ids)}"
+        )
+
+        if not chunk_data:
             raise HTTPException(
                 status_code=422,
                 detail={
@@ -939,26 +1168,17 @@ async def generate_ai(request: Request):
                 },
             )
 
-        # Expand: one entry per requirement ID so Claude gets context for EVERY
-        # requirement even when multiple reqs share the same module/chunk.
-        # Use _extract_req_content to isolate each requirement's text so
-        # signals and conditions from sibling requirements don't bleed through.
-        chunk_data = []
-        for c in chunks:
-            # Use ONLY the primary ID — body-text cross-references inflate the count
-            req_id = c.requirement_ids[0] if c.requirement_ids else "REQ-001"
-            chunk_data.append({
-                "requirement_id":   req_id,
-                "content":          c.content,
-                "module":           c.module or "General",
-                "requirement_type": c.requirement_type,
-            })
-
-        # Store chunks in session for reference and queue for Claude AI
-        sessions[session_id]["chunks"] = chunks
-        generation_queue["chunks"]     = chunk_data
-        generation_queue["session_id"] = session_id
-        generation_queue["status"]     = "queued"
+        # Queue the merged set for Claude AI. get_generated_test_cases's
+        # batch_index/batch_size in mcp_server.py slices across this combined
+        # list, so a single batching pass now spans every document queued.
+        generation_queue["chunks"]      = chunk_data
+        generation_queue["session_id"]  = session_ids[0]
+        generation_queue["session_ids"] = session_ids
+        generation_queue["status"]      = "queued"
+        generation_queue["job_status"]  = "RUNNING"
+        generation_queue["activity_log"] = []
+        generation_queue["pending_clarification"] = None
+        generation_queue["rp6"]         = bool(data.get("review_points", {}).get("rp6", False))
 
         # Clear any stale MCP results so the UI does not show old data.
         # This is the single per-run reset boundary — both the visible store and
@@ -972,18 +1192,24 @@ async def generate_ai(request: Request):
 
         logger.info(
             f"AI generation queued: {len(chunk_data)} chunks "
-            f"(session={session_id})"
+            f"(sessions={session_ids})"
         )
+        await _emit("status", stage="Request Submitted",
+                    detail=f"{len(chunk_data)} requirements queued")
         return {
             "status":       "queued",
             "total_chunks": len(chunk_data),
-            "session_id":   session_id,
+            "session_id":   session_ids[0],
+            "session_ids":  session_ids,
+            "request_id":   session_ids[0],
         }
 
-    except HTTPException:
+    except HTTPException as e:
+        await _emit("error", message=str(e.detail))
         raise
     except Exception as e:
         logger.error(f"AI queue error: {traceback.format_exc()}")
+        await _emit("error", message=f"Generation failed to start: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1056,6 +1282,9 @@ async def save_mcp_results(request: Request):
     validated_tcs = report.valid_test_cases
     # Accumulate across saves (see save_finalise) instead of overwriting.
     validated_tcs = _merge_test_cases(mcp_results_store.get("test_cases"), validated_tcs)
+    # Attach Test Details Description etc. so the GUI shows the same text as
+    # the Excel/Word export instead of re-deriving it with stale JS logic.
+    validated_tcs = _attach_display_fields_all(validated_tcs)
     _mcp_summary = dict(data.get("summary", {}) or {})
     cov = _coverage(queued_req_ids, validated_tcs)
     _mcp_summary["requirements_total"]   = cov["requirements_total"]
@@ -1068,6 +1297,9 @@ async def save_mcp_results(request: Request):
         f"MCP results saved: {len(validated_tcs)} test cases "
         f"(fixed={report.auto_fixed}, dropped={report.dropped})"
     )
+    await _emit("status", stage="Completion",
+                detail=f"{len(validated_tcs)} test cases saved")
+    await _emit("result", test_cases=validated_tcs, summary=_mcp_summary)
     return {"status": "saved", "total": len(validated_tcs),
             "validation": _last_validation_report}
 
@@ -1077,55 +1309,75 @@ async def save_mcp_results(request: Request):
 # so each MCP call stays well under the 1MB payload limit.
 _chunk_buffer: list = []
 
+def _check_job_status():
+    """Raises if Job Status is PAUSED or STOPPED (set via /api/job/pause|stop).
+    Called from save_chunk and save_finalise — the generation loop's actual
+    check-before-processing points. Claude Desktop runs the multi-batch loop
+    autonomously inside its own chat turn (seeded by one upfront prompt from
+    /api/open-claude); the backend has no channel to reach into that turn and
+    interrupt it directly. What it CAN guarantee is that nothing gets
+    persisted once Job Status leaves RUNNING, and that the next tool call
+    Claude makes gets a plain-language instruction to stop or hold."""
+    job_status = generation_queue.get("job_status", "RUNNING")
+    if job_status == "STOPPED":
+        raise HTTPException(status_code=409, detail={
+            "job_status": "STOPPED",
+            "message": ("Generation was stopped by the user. This batch was NOT saved. "
+                        "Do not retry it, and make no further tool calls for this run."),
+        })
+    if job_status == "PAUSED":
+        raise HTTPException(status_code=409, detail={
+            "job_status": "PAUSED",
+            "message": ("Generation is paused by the user. This batch was NOT saved. "
+                        "Hold this exact batch and retry the same save once the user "
+                        "resumes — do not move on to the next batch in the meantime."),
+        })
+
+
 @app.post("/api/mcp/save_chunk")
 async def save_chunk(request: Request):
     """Receives one batch of test cases. Buffers them in memory.
     Called once per batch. Use is_last=True on the final batch."""
     global _chunk_buffer
+    _check_job_status()
     data = await request.json()
     chunk = [_normalise_mcp_tc(tc) for tc in data.get("test_cases", [])]
     is_last = data.get("is_last", False)
     _chunk_buffer.extend(chunk)
     logger.info(f"[CHUNK SAVE] +{len(chunk)} test cases | buffer_total={len(_chunk_buffer)} | is_last={is_last}")
+    generation_queue["status"] = "generating"
+    await _emit("status", stage="Test Case Generation",
+                detail=f"+{len(chunk)} test cases, running total {len(_chunk_buffer)}")
     return {"status": "chunk_received", "buffer_total": len(_chunk_buffer), "is_last": is_last}
 
 
-@app.post("/api/mcp/save_finalise")
-async def save_finalise():
-    """Merges all buffered chunks into mcp_results_store and completes the queue.
-    Called once after the final batch's save_chunk."""
-    global _chunk_buffer
+def _finalise_test_cases(test_cases: list) -> dict:
+    """Shared finalisation logic: validate, merge into the accumulated store,
+    build the summary. Used by both /api/mcp/save_finalise (normal end-of-run,
+    Claude-driven) and /api/generation/stop (user-forced stop, salvaging
+    whatever was buffered so it isn't lost)."""
     from collections import Counter
 
-    test_cases = list(_chunk_buffer)
-    _chunk_buffer = []
-
-    if not test_cases:
-        raise HTTPException(status_code=400, detail="No chunks buffered. Send chunks via save_chunk first.")
-
-    # ── OUTPUT VALIDATION ────────────────────────────────────────────────
-    # Get valid req IDs from the generation queue for traceability check
     queued_req_ids = {
         c.get("requirement_id") for c in generation_queue.get("chunks", [])
         if c.get("requirement_id")
     }
     report = validate_test_cases(test_cases, valid_req_ids=queued_req_ids or None)
     _last_validation_report.update(report.summary())
-    test_cases = report.valid_test_cases  # use validated + fixed list
+    test_cases = report.valid_test_cases
 
     if report.dropped > 0:
         logger.warning(
             f"[VALIDATION] Dropped {report.dropped} malformed test cases. "
             f"Errors: {report.summary()['error_count']}"
         )
-    # ─────────────────────────────────────────────────────────────────────
 
     # Accumulate across batches: merge this finalised batch into whatever is
-    # already stored for this run rather than overwriting it. This makes the
-    # merge independent of how the generator flags is_partial — every batch
-    # that reaches the backend is retained. The store is reset once per run
-    # in /api/generate/ai, which is the real "new generation" boundary.
+    # already stored for this run rather than overwriting it.
     test_cases = _merge_test_cases(mcp_results_store.get("test_cases"), test_cases)
+    # Attach Test Details Description etc. so the GUI shows the same text as
+    # the Excel/Word export instead of re-deriving it with stale JS logic.
+    test_cases = _attach_display_fields_all(test_cases)
 
     cov = _coverage(queued_req_ids, test_cases)
     summary = {
@@ -1144,14 +1396,105 @@ async def save_finalise():
     mcp_results_store["test_cases"] = test_cases
     mcp_results_store["summary"]    = summary
     mcp_results_store["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    generation_queue["status"]      = "complete"
+    return summary
 
-    logger.info(
-        f"[FINALISE] Saved {len(test_cases)} validated test cases "
-        f"(fixed={report.auto_fixed}, dropped={report.dropped})"
-    )
-    return {"status": "finalised", "total": len(test_cases),
+
+@app.post("/api/mcp/save_finalise")
+async def save_finalise():
+    """Merges all buffered chunks into mcp_results_store and completes the queue.
+    Called once after the final batch's save_chunk."""
+    global _chunk_buffer
+    _check_job_status()
+
+    test_cases = list(_chunk_buffer)
+    _chunk_buffer = []
+
+    if not test_cases:
+        await _emit("error", message="save_finalise called with no chunks buffered — call save_chunk first")
+        raise HTTPException(status_code=400, detail="No chunks buffered. Send chunks via save_chunk first.")
+
+    summary = _finalise_test_cases(test_cases)
+    generation_queue["status"] = "complete"
+
+    logger.info(f"[FINALISE] Saved {summary['total']} validated test cases")
+    await _emit("status", stage="Completion",
+                detail=f"{summary['total']} test cases finalised")
+    await _emit("result", test_cases=mcp_results_store["test_cases"], summary=summary)
+    return {"status": "finalised", "total": summary["total"],
             "summary": summary, "validation": _last_validation_report}
+
+
+# ─── JOB CONTROL (pause / resume / stop) ──────────────────────────────────────
+# User Clicks Stop → GUI → POST /api/job/stop → Backend sets Job Status = STOPPED
+# → the generation loop's check points (save_chunk / save_finalise, plus the
+# /api/ai/queue fetch below) see it on their next call → stop further processing.
+#
+# The backend can't reach into Claude's live turn and interrupt an in-flight
+# tool call — what it CAN do reliably is (a) refuse to hand out further batches
+# or accept further saves once Job Status leaves RUNNING, and (b) tell Claude
+# plainly, in the tool result itself, to stop or hold. Claude will generally
+# comply on its *next* tool call because the instruction is in the data it
+# just read — but a currently-executing tool call (e.g. mid-generation before
+# it calls save_enhanced_test_cases) will still finish that one step; this is
+# a limit of the MCP execution layer, not something a backend flag can reach
+# into. Stop salvages whatever was already buffered so it isn't lost.
+
+@app.get("/api/job/status")
+async def get_job_status():
+    """Current Job Status, for the GUI to reconcile on load/reconnect
+    (the websocket 'control' event is the live path; this is the pull path)."""
+    return {
+        "job_status": generation_queue.get("job_status", "RUNNING"),
+        "stage":      generation_queue.get("status"),
+    }
+
+
+@app.post("/api/job/pause")
+async def pause_job():
+    if generation_queue.get("job_status") == "STOPPED":
+        raise HTTPException(status_code=400, detail="Job already stopped — cannot pause.")
+    generation_queue["job_status"] = "PAUSED"
+    await _emit("control", state="paused")
+    logger.info("[JOB] Status -> PAUSED (user).")
+    return {"job_status": "PAUSED"}
+
+
+@app.post("/api/job/resume")
+async def resume_job():
+    if generation_queue.get("job_status") == "STOPPED":
+        raise HTTPException(status_code=400, detail="Cannot resume a stopped job — start a new generation.")
+    generation_queue["job_status"] = "RUNNING"
+    await _emit("control", state="running")
+    logger.info("[JOB] Status -> RUNNING (resumed by user).")
+    return {"job_status": "RUNNING"}
+
+
+@app.post("/api/job/stop")
+async def stop_job():
+    """Job Status = STOPPED. Any chunks already buffered (saved via save_chunk
+    but not yet finalised) are salvaged into mcp_results_store so partial
+    results stay available through Load Results — nothing already generated
+    is thrown away."""
+    global _chunk_buffer
+    generation_queue["job_status"] = "STOPPED"
+
+    salvaged = 0
+    if _chunk_buffer:
+        test_cases = list(_chunk_buffer)
+        _chunk_buffer = []
+        summary = _finalise_test_cases(test_cases)
+        salvaged = summary["total"]
+        generation_queue["status"] = "complete"
+        await _emit("status", stage="Completion",
+                    detail=f"Stopped by user — {salvaged} test cases salvaged")
+        await _emit("result", test_cases=mcp_results_store["test_cases"], summary=summary)
+    else:
+        await _emit("status", stage=generation_queue.get("status", "Test Case Generation"),
+                    detail="Stopped by user — no test cases had been buffered yet")
+
+    await _emit("control", state="stopped", salvaged=salvaged)
+    logger.info(f"[JOB] Status -> STOPPED (user). Salvaged {salvaged} test cases.")
+    return {"job_status": "STOPPED", "salvaged_test_cases": salvaged}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1236,12 +1579,35 @@ def export_mcp_docx():
 # ─── AI GENERATION QUEUE ──────────────────────────────────────────────────────
 
 @app.get("/api/ai/queue")
-def get_ai_queue():
-    """Claude Desktop MCP server calls this to get pending requirements."""
+async def get_ai_queue():
+    """Claude Desktop MCP server calls this to get pending requirements.
+    This is the fetch-side half of 'Generation Loop Checks Status' — the
+    save-side half is _check_job_status() in save_chunk/save_finalise."""
+    job_status = generation_queue.get("job_status", "RUNNING")
+    if job_status == "STOPPED":
+        return {
+            "chunks": [], "status": generation_queue["status"], "total": 0,
+            "job_status": "STOPPED",
+            "message": ("Generation was stopped by the user from the GUI. Do not "
+                        "fetch further batches or generate more test cases for this run."),
+        }
+    if job_status == "PAUSED":
+        return {
+            "chunks": [], "status": generation_queue["status"], "total": 0,
+            "job_status": "PAUSED",
+            "message": ("Generation is paused by the user from the GUI. Stop here and "
+                        "do not continue — wait for the user to resume before fetching "
+                        "further batches."),
+        }
+    generation_queue["status"] = "analysis"
+    await _emit("status", stage="Requirement Analysis",
+                detail=f"{len(generation_queue['chunks'])} requirements fetched")
     return {
         "chunks": generation_queue["chunks"],
         "status": generation_queue["status"],
         "total":  len(generation_queue["chunks"]),
+        "job_status": "RUNNING",
+        "rp6_merge":  generation_queue.get("rp6", False),
     }
 
 
@@ -1341,15 +1707,25 @@ async def post_ai_queue(request: Request):
     """React UI posts chunks here for Claude Desktop to process."""
     data = await request.json()
     generation_queue["chunks"]     = data.get("chunks", [])
-    generation_queue["session_id"] = data.get("session_id")
+    generation_queue["session_id"] = data.get("session_id") or str(uuid.uuid4())
     generation_queue["status"]     = "queued"
-    return {"status": "queued", "total": len(generation_queue["chunks"])}
+    generation_queue["job_status"] = "RUNNING"
+    generation_queue["activity_log"] = []
+    generation_queue["pending_clarification"] = None
+    await _emit("status", stage="Request Submitted",
+                detail=f"{len(generation_queue['chunks'])} requirements queued")
+    return {
+        "status": "queued",
+        "total": len(generation_queue["chunks"]),
+        "request_id": generation_queue["session_id"],
+    }
 
 
 @app.post("/api/ai/complete")
 async def mark_ai_complete(request: Request):
     """Called by mcp_server.py when Claude Desktop finishes generation."""
     generation_queue["status"] = "complete"
+    await _emit("status", stage="Completion", detail="Generation finished")
     return {"status": "complete"}
 
 
@@ -1360,6 +1736,65 @@ def get_ai_status():
         "status":   generation_queue["status"],
         "has_data": bool(mcp_results_store.get("test_cases")),
     }
+
+
+# ── Clarification (blocking) ──────────────────────────────────────────────────
+# Claude Desktop never talks to the GUI directly. To surface a mid-generation
+# question in the React UI, the MCP tool call that needs an answer blocks here
+# — polling this in-memory state — until the GUI posts a response or the
+# timeout elapses. From Claude Desktop's side this just looks like one slow
+# tool call; the "conversation" is entirely a GUI <-> backend affair.
+CLARIFICATION_TIMEOUT_S = 300
+
+
+@app.post("/api/mcp/clarify")
+async def request_clarification(request: Request):
+    """Called by mcp_server.py's ask_clarification tool. Blocks until the GUI
+    answers or CLARIFICATION_TIMEOUT_S elapses, then returns the answer."""
+    data = await request.json()
+    question = data.get("question", "").strip()
+    options  = data.get("options") or None
+    if not question:
+        await _emit("error", message="ask_clarification called with an empty question")
+        raise HTTPException(status_code=400, detail="question is required")
+
+    generation_queue["status"] = "clarifying"
+    generation_queue["pending_clarification"] = {
+        "question": question, "options": options, "answer": None,
+    }
+    await _emit("clarification_question", question=question, options=options)
+
+    waited = 0.0
+    poll_interval = 0.5
+    while waited < CLARIFICATION_TIMEOUT_S:
+        pending = generation_queue.get("pending_clarification")
+        if pending and pending.get("answer") is not None:
+            answer = pending["answer"]
+            generation_queue["pending_clarification"] = None
+            generation_queue["status"] = "generating"
+            return {"answered": True, "answer": answer}
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+
+    # Timed out — clear the pending question so the GUI stops showing it.
+    generation_queue["pending_clarification"] = None
+    generation_queue["status"] = "generating"
+    await _emit("error", message="Clarification timed out after 5 minutes — Claude will proceed without an answer")
+    return {"answered": False, "answer": None}
+
+
+@app.post("/api/clarify/respond")
+async def respond_to_clarification(request: Request):
+    """Called by the React UI when the user answers a clarification question."""
+    data = await request.json()
+    answer = data.get("answer", "").strip()
+    pending = generation_queue.get("pending_clarification")
+    if not pending:
+        await _emit("error", message="Received a clarification answer but nothing is pending")
+        raise HTTPException(status_code=409, detail="No clarification is currently pending")
+    pending["answer"] = answer
+    await _emit("user_response", answer=answer)
+    return {"status": "received"}
 
 
 # ── Serve React frontend ─────────────────────────────────────────────────────

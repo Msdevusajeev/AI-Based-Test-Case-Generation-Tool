@@ -1,12 +1,13 @@
 import { useState, useRef, useCallback } from 'react'
 
-const ACCEPTED = ['.pdf', '.docx', '.xlsx']
+const ACCEPTED = ['.pdf', '.docx', '.xlsx', '.txt']
 const ICONS = {
   pdf:  '📄',
   docx: '📝',
   doc:  '📝',
   xlsx: '📊',
   xls:  '📊',
+  txt:  '📃',
 }
 
 const DOC_TYPES = [
@@ -52,7 +53,7 @@ function FileDropZone({ docType, file, loading, error, onFile, onClear }) {
         <input
           ref={inputRef}
           type="file"
-          accept=".pdf,.docx,.xlsx"
+          accept=".pdf,.docx,.xlsx,.txt"
           className="hidden"
           onClick={(e) => { e.target.value = '' }}
           onChange={(e) => onFile(e.target.files[0])}

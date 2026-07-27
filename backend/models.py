@@ -19,8 +19,22 @@ class TestCase(BaseModel):
     remarks: str
     module: str
     requirement_type: Literal["functional", "non-functional"]
-    scenario_type: Literal["normal", "boundary", "edge", "robustness", "transition"]
+    scenario_type: Literal["normal", "boundary", "edge", "robustness", "transition",
+                           "mcdc", "beyond_range", "fault", "timing"]
     testing_type: Literal["verification", "validation", "integration"]
+
+    # ── Server-computed GUI display fields ───────────────────────────────────
+    # Populated by output_generator.compute_gui_display_fields() before a
+    # TestCase leaves the API layer. These mirror the narrative columns
+    # written into the Excel/Word export exactly, so the GUI never has to
+    # (and must not) re-derive this text itself. Optional so that TestCase
+    # objects can still be constructed before these are computed.
+    test_details_description:  Optional[str] = None
+    test_precondition_display: Optional[str] = None
+    expected_outputs_display:  Optional[str] = None
+    depends_on_display:        Optional[str] = None
+    remarks_display:           Optional[str] = None
+    module_display:            Optional[str] = None
 
     @field_validator(
         "requirement_type", "scenario_type", "testing_type",
@@ -61,6 +75,7 @@ class ReviewPoints(BaseModel):
     rp3: bool = True
     rp4: bool = True
     rp5: bool = True
+    rp6: bool = False  # Smart Requirement Merging
 
 
 class GenerateRequest(BaseModel):

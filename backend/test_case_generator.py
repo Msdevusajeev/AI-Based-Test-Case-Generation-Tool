@@ -1831,7 +1831,7 @@ def _resequence(test_cases: List[TestCase]) -> List[TestCase]:
     Rules:
       1. ONE TC_ID per requirement — increments only when req ID changes.
       2. SC resets to SC_001 for each new requirement group.
-      3. Depands_On:
+      3. Depends_On:
            SC_001 (baseline) -> "None"
            SC_002+           -> TC_ID_SC-001  (hyphen, references baseline)
     """
@@ -2311,7 +2311,7 @@ def generate_all(
     else:
         removed = 0
 
-    # Always resequence: shared TC_ID per req, SC resets per req, Depands_On set.
+    # Always resequence: shared TC_ID per req, SC resets per req, Depends_On set.
     # Runs regardless of rp5 so GUI and Excel always show the same TC_IDs.
     all_test_cases = _resequence(all_test_cases)
 

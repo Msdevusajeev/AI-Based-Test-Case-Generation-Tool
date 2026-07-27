@@ -21,6 +21,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Set, Optional, Tuple
 
+from output_generator import _parse_signal_value  # single source of truth for "Name: Value" parsing
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -36,7 +38,17 @@ REQUIRED_FIELDS = [
 VALID_PRIORITY     = {"P1", "P2", "P3"}
 VALID_ENVIRONMENT  = {"Dev", "QA", "UAT", "Prod"}
 VALID_REQ_TYPE     = {"functional", "non-functional"}
-VALID_SCENARIO     = {"normal", "boundary", "edge", "robustness", "transition"}
+VALID_SCENARIO     = {
+    "normal", "boundary", "edge", "robustness", "transition",
+    # Added: these are the skill's actual advanced categories (general-tc-skill's
+    # canonical Scenario_Type row is Normal/Boundary/Edge/Robustness/MCDC/
+    # Beyond-Range/Fault/Timing). Before this, any TC tagged with one of these
+    # fell through the fuzzy-match below with no matching substring and got
+    # silently rewritten to "normal" — meaning genuinely rigorous MC/DC,
+    # fault-injection, beyond-range, and timing test cases were indistinguishable
+    # from ordinary nominal-path cases the moment they were saved.
+    "mcdc", "beyond_range", "fault", "timing",
+}
 VALID_TESTING      = {"verification", "validation", "integration"}
 
 # Placeholder strings Claude sometimes writes when it doesn't know a value
@@ -58,6 +70,44 @@ GENERIC_INPUT_VALUE_PATTERNS = re.compile(
 )
 
 EMPTY_LIKE = {"", "-", "--", "none", "n/a", "tbd", "null", "nil"}
+
+
+@dataclass
+class CoverageGap:
+    traceability_req_id: str
+    test_case_id: str
+    category: str      # "missing_scenario_type" | "no_baseline" | "unpaired_signal" |
+                        # "unlinked_dependency" | "generic_expected_outcome"
+    detail: str
+    severity: str = "gap"   # kept for symmetry with TestCaseIssue; always "gap" today
+
+
+@dataclass
+class CoverageReport:
+    total_requirement_groups: int = 0
+    groups_with_gaps: int = 0
+    gaps: List[CoverageGap] = field(default_factory=list)
+
+    def summary(self) -> Dict[str, Any]:
+        by_category: Dict[str, int] = {}
+        for g in self.gaps:
+            by_category[g.category] = by_category.get(g.category, 0) + 1
+        return {
+            "total_requirement_groups": self.total_requirement_groups,
+            "groups_with_gaps":         self.groups_with_gaps,
+            "groups_clean":             self.total_requirement_groups - self.groups_with_gaps,
+            "total_gaps":               len(self.gaps),
+            "gaps_by_category":         by_category,
+            "gap_details": [
+                {
+                    "traceability_req_id": g.traceability_req_id,
+                    "test_case_id":        g.test_case_id,
+                    "category":            g.category,
+                    "detail":              g.detail,
+                }
+                for g in self.gaps
+            ],
+        }
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -263,13 +313,26 @@ def _fix_literals(
     # scenario_type
     st = str(tc.get("scenario_type", "normal")).lower().strip()
     if st not in VALID_SCENARIO:
-        fixed = "boundary"   if "bound" in st else \
-                "edge"        if "edge" in st or "corner" in st else \
-                "robustness"  if "robust" in st or "neg" in st else \
-                "transition"  if "trans" in st else "normal"
+        _norm = st.replace("-", " ").replace("/", " ").replace("_", " ")
+        fixed = (
+            "mcdc"         if "mcdc" in _norm.replace(" ", "") or "decision coverage" in _norm else
+            "beyond_range" if "beyond" in _norm and "range" in _norm else
+            "timing"       if "timing" in _norm or "timeout" in _norm or "latency" in _norm else
+            "fault"        if "fault" in _norm or _norm.strip() in ("hf", "sf") else
+            "boundary"     if "bound" in _norm else
+            "edge"         if "edge" in _norm or "corner" in _norm else
+            "robustness"   if "robust" in _norm or "neg" in _norm else
+            "transition"   if "trans" in _norm else "normal"
+        )
         issues.append(TestCaseIssue(tc_id, req_id, "fixed", "scenario_type",
                                     f"{st!r} → {fixed!r}"))
-        tc["scenario_type"] = fixed
+        st = fixed
+    # Always write back the normalised (lowercase) value, even when st was
+    # already valid as-is — otherwise a validly-mapped-but-mis-cased value
+    # like "Timing" or "MCDC" skips the fix branch above and leaks through
+    # with its original casing, silently failing to match the frontend's
+    # lowercase scenario-type color/badge keys.
+    tc["scenario_type"] = st
 
     # testing_type
     tt = str(tc.get("testing_type", "verification")).lower().strip()
@@ -345,3 +408,164 @@ def _fuzzy_req_match(rid: str, valid_ids: Set[str]) -> Optional[str]:
         if re.sub(r'[\s_-]+', '_', valid.upper()) == rid_norm:
             return valid
     return None
+
+
+# ── LAYER 5: Coverage gap checking ─────────────────────────────────────────────
+# Everything above validates individual test cases in isolation (schema,
+# content, traceability). This layer checks the GROUP of test cases sharing
+# a test_case_id against a fixed, deterministic taxonomy — it does not use
+# an LLM and does not need one: whether a normal/baseline scenario exists,
+# whether every input signal has an MC/DC independence pair, whether a
+# robustness scenario exists, whether non-baseline scenarios actually link
+# back to their baseline via dependent_test_cases, and whether
+# expected_outcome is a real signal assertion rather than empty/generic
+# text. This is intentionally mechanical: a set-difference against a fixed
+# category list, not a judgment call, so its output is auditable.
+
+_SKIP_SIGNAL_NAMES = {"test environment", "all prerequisite", "sub-requirements"}
+
+# Categories every requirement's test-case group is expected to cover.
+# "edge" and "transition" are conditional (only expected when the group
+# itself already contains evidence they apply — see _expected_categories)
+# rather than mandatory for every requirement, since not every requirement
+# has state-transition or edge-case semantics.
+_MANDATORY_CATEGORIES = ["normal", "boundary", "robustness"]
+
+
+def _group_key(tc: Dict[str, Any]) -> Tuple[str, str]:
+    return (str(tc.get("traceability_req_id", "?")), str(tc.get("test_case_id", "?")))
+
+
+def _signal_names(tc: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        name: val
+        for name, val in (_parse_signal_value(str(e)) for e in (tc.get("inputs") or []))
+        if name and name.lower() not in _SKIP_SIGNAL_NAMES
+    }
+
+
+def _expected_categories(group: List[Dict[str, Any]]) -> List[str]:
+    cats = list(_MANDATORY_CATEGORIES)
+    # If any scenario in the group is already tagged edge/transition, treat
+    # that category as expected (i.e. don't just credit one row and move on —
+    # still checked for presence like any other category below). This keeps
+    # the taxonomy fixed rather than letting a single generated row silently
+    # define what "counts".
+    present = {str(tc.get("scenario_type", "")).lower() for tc in group}
+    for optional_cat in ("edge", "transition"):
+        if optional_cat in present:
+            cats.append(optional_cat)
+    return cats
+
+
+def check_coverage(test_cases: List[Dict[str, Any]]) -> CoverageReport:
+    """
+    Deterministic coverage-gap report over an already-generated test case set.
+
+    Groups test cases by (traceability_req_id, test_case_id) and checks each
+    group against a fixed taxonomy:
+      - a "normal" baseline scenario exists
+      - a "boundary" (MC/DC) scenario exists, AND every distinct input signal
+        on the baseline has at least one boundary sibling that isolates it
+        (same diff logic as output_generator._varied_signal_names)
+      - a "robustness" scenario exists
+      - "edge"/"transition" scenarios, if any are present in the group, are
+        checked for presence like any other category (no free pass)
+      - every non-baseline scenario's dependent_test_cases actually links
+        back to the baseline TC (not "None", not empty)
+      - expected_outcome is not empty/placeholder-like
+
+    This does NOT call an LLM. It is a mechanical set-difference against the
+    taxonomy, meant to be run after generation (or against an already-saved/
+    exported batch) as a fast, auditable gap check — not a judgment about
+    requirement intent.
+    """
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for tc in test_cases:
+        groups.setdefault(_group_key(tc), []).append(tc)
+
+    report = CoverageReport(total_requirement_groups=len(groups))
+
+    for (req_id, tc_id), group in groups.items():
+        gaps: List[CoverageGap] = []
+
+        baseline = next(
+            (tc for tc in group if str(tc.get("scenario_type", "")).lower() == "normal"),
+            None,
+        )
+        if baseline is None:
+            gaps.append(CoverageGap(
+                req_id, tc_id, "no_baseline",
+                "No 'normal' scenario found — there is no nominal-behaviour "
+                "baseline to compare boundary/MC-DC rows against, and no "
+                "reference for what 'correct' looks like under this requirement."
+            ))
+
+        present_categories = {str(tc.get("scenario_type", "")).lower() for tc in group}
+        for cat in _expected_categories(group):
+            if cat not in present_categories:
+                gaps.append(CoverageGap(
+                    req_id, tc_id, "missing_scenario_type",
+                    f"No '{cat}' scenario present for this requirement."
+                ))
+
+        # MC/DC independence-pair completeness: every baseline signal should
+        # be the sole varied signal on at least one boundary-type sibling.
+        if baseline is not None:
+            baseline_signals = _signal_names(baseline)
+            boundary_rows = [tc for tc in group if str(tc.get("scenario_type", "")).lower() == "boundary"]
+            covered_signals: Set[str] = set()
+            for row in boundary_rows:
+                row_signals = _signal_names(row)
+                varied = [
+                    name for name, val in row_signals.items()
+                    if name in baseline_signals and baseline_signals[name] != val
+                ]
+                if len(varied) == 1:
+                    covered_signals.add(varied[0])
+                # len(varied) == 0 or > 1 means this row doesn't cleanly
+                # isolate a single signal — not flagged here directly, but
+                # it means it won't count toward covering any signal below.
+            for name in baseline_signals:
+                if name not in covered_signals:
+                    gaps.append(CoverageGap(
+                        req_id, tc_id, "unpaired_signal",
+                        f"Input signal '{name}' has no boundary scenario that "
+                        f"isolates it as the sole varied condition — its MC/DC "
+                        f"independence pair is missing or doesn't cleanly vary "
+                        f"only this signal."
+                    ))
+
+        # Dependency linkage: every non-baseline row should reference the
+        # baseline (or another sibling) via dependent_test_cases, not "None".
+        for tc in group:
+            if tc is baseline:
+                continue
+            dep = str(tc.get("dependent_test_cases", "") or "").strip()
+            if _is_empty(dep):
+                gaps.append(CoverageGap(
+                    req_id, tc_id, "unlinked_dependency",
+                    f"Scenario {tc.get('scenario_id', '?')} does not link back "
+                    f"to a baseline via dependent_test_cases — traceability "
+                    f"from this scenario to the nominal case is broken."
+                ))
+
+        # expected_outcome must be a real assertion, not empty/placeholder.
+        for tc in group:
+            outcome = str(tc.get("expected_outcome", "") or "").strip()
+            if _is_empty(outcome):
+                gaps.append(CoverageGap(
+                    req_id, tc_id, "generic_expected_outcome",
+                    f"Scenario {tc.get('scenario_id', '?')} has an empty or "
+                    f"placeholder expected_outcome — nothing to verify against."
+                ))
+
+        if gaps:
+            report.groups_with_gaps += 1
+            report.gaps.extend(gaps)
+
+    logger.info(
+        f"[COVERAGE] {report.total_requirement_groups} requirement groups checked → "
+        f"{report.groups_with_gaps} with gaps, {len(report.gaps)} total gaps"
+    )
+    return report
