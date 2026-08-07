@@ -38,10 +38,11 @@ else:
 from models import (
     UploadResponse, GenerateRequest, GenerateResponse,
     GenerateSummary, HealthResponse, ReviewPoints,
+    MergeSessionsRequest, MergeSessionsResponse,
 )
 from config import ENGINE, VERSION, CHUNK_SIZE_WORDS, MCP_ENABLED
 from file_parser import parse_file
-from document_ingestion import ingest_document
+from document_ingestion import ingest_document, attach_icd_context
 import doc_cache
 from output_validator   import validate_test_cases
 from test_case_generator import generate_all, is_spacy_available
@@ -220,12 +221,15 @@ def _coverage(srs_req_ids, test_cases) -> Dict[str, int]:
     covered  = those SRS requirements that have >=1 test case tracing to them
     """
     srs = {_canon_req_id(r) for r in (srs_req_ids or []) if _canon_req_id(r)}
-    tc_ids = {
-        _canon_req_id(tc.get("traceability_req_id") if isinstance(tc, dict)
-                      else getattr(tc, "traceability_req_id", ""))
-        for tc in (test_cases or [])
-    }
-    tc_ids.discard("")
+    # Handle merged IDs like "REQ_001, REQ_002" — split and count each part
+    tc_ids = set()
+    for tc in (test_cases or []):
+        raw = (tc.get("traceability_req_id") if isinstance(tc, dict)
+               else getattr(tc, "traceability_req_id", ""))
+        for part in str(raw or "").split(","):
+            cid = _canon_req_id(part.strip())
+            if cid:
+                tc_ids.add(cid)
     if srs:
         return {"requirements_total": len(srs),
                 "requirements_covered": len(srs & tc_ids)}
@@ -290,9 +294,21 @@ _TC_DEFAULTS = {
     "test_environment": "Dev", "remarks": "", "module": "General",
     "requirement_type": "functional", "scenario_type": "normal",
     "testing_type": "verification",
+    # Optional per-TC overrides — populated by the MCP/Claude-AI path when
+    # the skill in use already knows the domain. None here means "no
+    # override supplied", so compute_gui_display_fields falls back to the
+    # session-level `domain` default (see /api/mcp/domain).
+    "safety_level": None, "test_level": None, "standard_reference": None,
 }
 
-def _attach_display_fields(raw: dict, siblings: Optional[list] = None) -> dict:
+# Session-level domain for the MCP/Claude-Desktop generation path (there is
+# no per-request body Claude Desktop sends us that we control — it drives
+# tools directly — so this is set via a small dedicated endpoint the GUI
+# calls when the user picks a domain for that run, and defaults to
+# "general" otherwise).
+mcp_results_store.setdefault("domain", "general")
+
+def _attach_display_fields(raw: dict, siblings: Optional[list] = None, domain: Optional[str] = None) -> dict:
     """Computes test_details_description (+ the other display columns) for a
     raw MCP test-case dict and merges them in-place. Never drops or
     overwrites the caller's original fields — only adds the derived ones.
@@ -306,7 +322,10 @@ def _attach_display_fields(raw: dict, siblings: Optional[list] = None) -> dict:
     merged = {**_TC_DEFAULTS, **{k: v for k, v in raw.items() if k in _TC_DEFAULTS}}
     try:
         tc_obj = _TestCase(**merged)
-        raw.update(compute_gui_display_fields(tc_obj, siblings=siblings))
+        raw.update(compute_gui_display_fields(
+            tc_obj, siblings=siblings,
+            domain=domain or mcp_results_store.get("domain", "general"),
+        ))
     except Exception:
         logger.warning(
             f"Could not compute GUI display fields for "
@@ -315,11 +334,12 @@ def _attach_display_fields(raw: dict, siblings: Optional[list] = None) -> dict:
     return raw
 
 
-def _attach_display_fields_all(test_cases: list) -> list:
+def _attach_display_fields_all(test_cases: list, domain: Optional[str] = None) -> list:
     """Builds a TestCase object for every raw dict once (so each row can see
     its siblings for MC/DC signal detection), then attaches the computed
     display fields to each original dict."""
     from models import TestCase as _TestCase
+    dom = domain or mcp_results_store.get("domain", "general")
     tc_objs = []
     for raw in test_cases:
         merged = {**_TC_DEFAULTS, **{k: v for k, v in raw.items() if k in _TC_DEFAULTS}}
@@ -332,7 +352,7 @@ def _attach_display_fields_all(test_cases: list) -> list:
             continue
         siblings = [o for o in tc_objs if o is not None]
         try:
-            raw.update(compute_gui_display_fields(tc_obj, siblings=siblings))
+            raw.update(compute_gui_display_fields(tc_obj, siblings=siblings, domain=dom))
         except Exception:
             logger.warning(
                 f"Could not compute GUI display fields for "
@@ -616,6 +636,58 @@ async def upload(file: UploadFile = File(...), doc_type: str = "srs"):
     )
 
 
+@app.post("/api/merge_sessions", response_model=MergeSessionsResponse)
+def merge_sessions(request: MergeSessionsRequest):
+    """
+    Combine several previously-/api/upload-ed documents of the same doc_type
+    (SRS or ICD) into one virtual session, so a multi-document SRS/ICD upload
+    can be fed into the EXISTING single-session_id generation pipeline
+    (/api/generate, /api/generate/ai, /api/scope) completely unchanged.
+
+    Purely additive: no other endpoint's logic is touched. If only one
+    session_id is supplied, that same session is returned as-is (no new
+    session is created) so the "single document" path stays byte-for-byte
+    what it always was.
+    """
+    valid_ids = [sid for sid in request.session_ids if sid in sessions]
+    if not valid_ids:
+        raise HTTPException(status_code=404, detail="No valid sessions found to merge")
+
+    if len(valid_ids) == 1:
+        sid = valid_ids[0]
+        s = sessions[sid]
+        return MergeSessionsResponse(
+            session_id         = sid,
+            filename            = s["filename"],
+            char_count          = len(s.get("text", "")),
+            text_preview        = s.get("text", "")[:500],
+            source_session_ids  = valid_ids,
+        )
+
+    merged_text = "\n\n".join(sessions[sid].get("text", "") for sid in valid_ids)
+    merged_names = [sessions[sid]["filename"] for sid in valid_ids]
+
+    merged_id = str(uuid.uuid4())
+    sessions[merged_id] = {
+        "filename":           f"{len(valid_ids)} documents merged ({', '.join(merged_names)})",
+        "doc_type":           request.doc_type,
+        "text":               merged_text,
+        "file_hash":          None,
+        "chunks":             None,
+        "test_cases":         None,
+        "removed":            0,
+        "source_session_ids": valid_ids,
+    }
+
+    return MergeSessionsResponse(
+        session_id          = merged_id,
+        filename            = sessions[merged_id]["filename"],
+        char_count          = len(merged_text),
+        text_preview        = merged_text[:500],
+        source_session_ids  = valid_ids,
+    )
+
+
 # ─── GENERATE ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/scope")
@@ -699,15 +771,21 @@ def generate(request: GenerateRequest):
         if request.supporting_session_id and request.supporting_session_id in sessions:
             supporting_text = sessions[request.supporting_session_id].get("text", "")
 
-        combined_text = text
-        if icd_text:
-            combined_text += f"\n\n[ICD_DOCUMENT_START]\n{icd_text}\n[ICD_DOCUMENT_END]"
-        if supporting_text:
-            combined_text += f"\n\n[SUPPORTING_DOCUMENT_START]\n{supporting_text}\n[SUPPORTING_DOCUMENT_END]"
-
         # Ingest SRS ONLY — ICD/supporting text contains identifiers that
         # confuse the parser and create phantom requirement chunks.
         chunks, _text_hash, _was_cached = _ingest_with_cache(text, CHUNK_SIZE_WORDS)
+
+        # Cross-reference: attach ICD/supporting-document signal specs
+        # (data type, valid range, unit, enum values) to every chunk that
+        # references a signal defined there. This is what lets BVA/ECP
+        # generation use the ICD's declared range even when the SRS
+        # sentence itself never states the numbers inline.
+        if icd_text or supporting_text:
+            matched_signals = attach_icd_context(chunks, icd_text, supporting_text)
+            logger.info(
+                f"[ICD-XREF] parsed {len(matched_signals)} ICD/supporting signal(s); "
+                f"{sum(1 for c in chunks if c.icd_signals)} of {len(chunks)} chunks matched"
+            )
 
         # ── Requirement ID prefix filter (rule-based) ────────────────────────
         req_prefixes = getattr(request, "req_prefixes", None) or []
@@ -789,12 +867,15 @@ def generate(request: GenerateRequest):
         # rule-engine results directly) shows the same text as the Excel/Word
         # export instead of re-deriving it with stale JS logic.
         for tc in test_cases:
-            for field_name, value in compute_gui_display_fields(tc, siblings=test_cases).items():
+            for field_name, value in compute_gui_display_fields(
+                tc, siblings=test_cases, domain=request.domain
+            ).items():
                 setattr(tc, field_name, value)
 
         sessions[request.session_id]["chunks"]     = chunks
         sessions[request.session_id]["test_cases"] = test_cases
         sessions[request.session_id]["removed"]    = removed
+        sessions[request.session_id]["domain"]     = request.domain
 
         # In-scope SRS requirements = PRIMARY requirement ID per chunk only.
         # Using all requirement_ids inflates the count with cross-reference
@@ -1037,6 +1118,14 @@ async def generate_ai(request: Request):
         data       = await request.json()
         session_id = data.get("session_id")
 
+        # Domain for Safety_Level/Test_Level/Standard_Reference defaults —
+        # same session-level selector as the rule-based path's
+        # GenerateRequest.domain (see /api/mcp/domain for the equivalent
+        # explicit-set endpoint used when this isn't sent).
+        requested_domain = data.get("domain")
+        if requested_domain in ("avionics", "automotive", "healthcare", "general"):
+            mcp_results_store["domain"] = requested_domain
+
         # ── Multi-document support ─────────────────────────────────────────
         # Accept EITHER a single "session_id" (existing behaviour, unchanged)
         # OR a "session_ids" list, to batch requirements across every document
@@ -1087,8 +1176,7 @@ async def generate_ai(request: Request):
             logger.info(
                 f"[AI-ENDPOINT] ICD/supporting context attached "
                 f"(icd={bool(icd_text)}, supporting={bool(supporting_text)}) — "
-                f"note: informational only, not yet merged into ingestion for "
-                f"multi-document batches"
+                f"cross-referencing against every session's SRS chunks"
             )
 
         # ── Scope filter params (same for every document in the batch) ──────
@@ -1113,6 +1201,17 @@ async def generate_ai(request: Request):
             chunks, _text_hash, was_cached = _ingest_with_cache(text, CHUNK_SIZE_WORDS)
             if was_cached:
                 cache_hits += 1
+
+            # Cross-reference ICD/supporting signal specs into this
+            # session's chunks (applies to every document in the batch,
+            # not just the first — the multi-doc limitation noted above
+            # is now handled).
+            if icd_text or supporting_text:
+                matched_signals = attach_icd_context(chunks, icd_text, supporting_text)
+                logger.info(
+                    f"[ICD-XREF/AI] {filename} — parsed {len(matched_signals)} signal(s); "
+                    f"{sum(1 for c in chunks if c.icd_signals)} of {len(chunks)} chunks matched"
+                )
 
             # ── Requirement ID prefix filter ─────────────────────────────
             if req_prefixes:
@@ -1145,9 +1244,12 @@ async def generate_ai(request: Request):
             # EVERY requirement even when multiple reqs share the same chunk.
             for c in chunks:
                 req_id = c.requirement_ids[0] if c.requirement_ids else "REQ-001"
+                content_for_ai = c.content
+                if c.icd_context:
+                    content_for_ai = content_for_ai + "\n" + c.icd_context
                 chunk_data.append({
                     "requirement_id":   req_id,
-                    "content":          c.content,
+                    "content":          content_for_ai,
                     "module":           c.module or "General",
                     "requirement_type": c.requirement_type,
                     "source_session_id": sid,
@@ -1222,7 +1324,8 @@ def export_excel(session_id: str = Query(...)):
         _error("No generated test cases found", "export", "", "Run /api/generate first.", 404)
 
     try:
-        xlsx_bytes = generate_excel(session["test_cases"], session["removed"])
+        xlsx_bytes = generate_excel(session["test_cases"], session["removed"],
+                                     domain=session.get("domain", "general"))
     except Exception as e:
         _error("Excel export failed", "export", traceback.format_exc(), "Check server logs.")
 
@@ -1240,7 +1343,8 @@ def export_docx(session_id: str = Query(...)):
         _error("No generated test cases found", "export", "", "Run /api/generate first.", 404)
 
     try:
-        docx_bytes = generate_docx(session["test_cases"], session["removed"])
+        docx_bytes = generate_docx(session["test_cases"], session["removed"],
+                                    domain=session.get("domain", "general"))
     except Exception as e:
         _error("Word export failed", "export", traceback.format_exc(), "Check server logs.")
 
@@ -1252,6 +1356,24 @@ def export_docx(session_id: str = Query(...)):
 
 
 # ─── MCP RESULTS ──────────────────────────────────────────────────────────────
+
+@app.post("/api/mcp/domain")
+async def set_mcp_domain(request: Request):
+    """Sets the session-level domain (avionics/automotive/healthcare/general)
+    used to default Safety_Level/Test_Level/Standard_Reference for test
+    cases generated via the Claude Desktop MCP path, where there is no
+    per-request GenerateRequest.domain to read. The GUI should call this
+    when the user picks a domain before starting an MCP generation run.
+    Per-TC overrides (safety_level/test_level/standard_reference supplied
+    directly in a saved test case) still take precedence over this default.
+    """
+    data = await request.json()
+    domain = data.get("domain", "general")
+    if domain not in ("avionics", "automotive", "healthcare", "general"):
+        raise HTTPException(status_code=422, detail=f"Unknown domain: {domain!r}")
+    mcp_results_store["domain"] = domain
+    return {"domain": domain}
+
 
 @app.get("/api/mcp/latest")
 def get_mcp_latest():
@@ -1514,6 +1636,7 @@ def export_mcp_excel():
             "test_environment": "Dev", "remarks": "", "module": "General",
             "requirement_type": "functional", "scenario_type": "normal",
             "testing_type": "verification",
+            "safety_level": None, "test_level": None, "standard_reference": None,
         }
         test_cases = []
         for raw in mcp_results_store["test_cases"]:
@@ -1524,7 +1647,7 @@ def export_mcp_excel():
                 logger.warning(f"Skipping malformed test case: {raw.get('test_case_id','?')} — {traceback.format_exc()}")
         if not test_cases:
             raise HTTPException(status_code=422, detail="Test cases could not be parsed. Check Claude output format.")
-        xlsx_bytes = generate_excel(test_cases, 0)
+        xlsx_bytes = generate_excel(test_cases, 0, domain=mcp_results_store.get("domain", "general"))
         return Response(
             content    = xlsx_bytes,
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1553,6 +1676,7 @@ def export_mcp_docx():
             "test_environment": "Dev", "remarks": "", "module": "General",
             "requirement_type": "functional", "scenario_type": "normal",
             "testing_type": "verification",
+            "safety_level": None, "test_level": None, "standard_reference": None,
         }
         test_cases = []
         for raw in mcp_results_store["test_cases"]:
@@ -1563,7 +1687,7 @@ def export_mcp_docx():
                 logger.warning(f"Skipping malformed test case: {raw.get('test_case_id','?')} — {traceback.format_exc()}")
         if not test_cases:
             raise HTTPException(status_code=422, detail="Test cases could not be parsed. Check Claude output format.")
-        docx_bytes = generate_docx(test_cases, 0)
+        docx_bytes = generate_docx(test_cases, 0, domain=mcp_results_store.get("domain", "general"))
         return Response(
             content    = docx_bytes,
             media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

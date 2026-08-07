@@ -48,6 +48,11 @@ VALID_SCENARIO     = {
     # fault-injection, beyond-range, and timing test cases were indistinguishable
     # from ordinary nominal-path cases the moment they were saved.
     "mcdc", "beyond_range", "fault", "timing",
+    # Added: dedicated invalid/out-of-range coverage generated from an
+    # ICD-cross-referenced signal's declared valid range (see
+    # test_case_generator._icd_full_range_scenarios). Distinct from
+    # "beyond_range" (threshold-driven) and "robustness" (keyword-driven).
+    "invalid_input",
 }
 VALID_TESTING      = {"verification", "validation", "integration"}
 
@@ -211,8 +216,19 @@ def validate_test_cases(
         # ── LAYER 4: Traceability ──────────────────────────────────────────────
         if valid_req_ids and tc.get("traceability_req_id"):
             rid = tc["traceability_req_id"]
-            if rid not in valid_req_ids:
-                # Try fuzzy match — maybe a minor suffix/case difference
+            # Handle merged IDs: "REQ_001, REQ_002" — check each part
+            parts = [r.strip() for r in rid.split(",") if r.strip()]
+            if len(parts) > 1:
+                # Merged requirement — validate each part individually
+                valid_parts = [p for p in parts if p in valid_req_ids]
+                if not valid_parts:
+                    issues.append(TestCaseIssue(
+                        tc_id, req_id, "warning", "traceability_req_id",
+                        f"Merged ID {rid!r} — none of the parts found in queued requirements"
+                    ))
+                # Keep the merged ID as-is — it is intentional
+            elif rid not in valid_req_ids:
+                # Single ID not found — try fuzzy match
                 match = _fuzzy_req_match(rid, valid_req_ids)
                 if match:
                     issues.append(TestCaseIssue(
@@ -319,6 +335,7 @@ def _fix_literals(
             "beyond_range" if "beyond" in _norm and "range" in _norm else
             "timing"       if "timing" in _norm or "timeout" in _norm or "latency" in _norm else
             "fault"        if "fault" in _norm or _norm.strip() in ("hf", "sf") else
+            "invalid_input" if "invalid" in _norm or "out of range" in _norm or "out range" in _norm else
             "boundary"     if "bound" in _norm else
             "edge"         if "edge" in _norm or "corner" in _norm else
             "robustness"   if "robust" in _norm or "neg" in _norm else

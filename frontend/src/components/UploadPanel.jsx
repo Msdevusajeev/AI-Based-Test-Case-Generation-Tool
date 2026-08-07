@@ -105,6 +105,37 @@ function FileDropZone({ docType, file, loading, error, onFile, onClear }) {
   )
 }
 
+function DuplicateDocModal({ fileName, onClose }) {
+  if (!fileName) return null
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      onClick={onClose}
+    >
+      <div
+        className="bg-card border border-red-500/30 rounded-xl p-6 max-w-md w-full mx-4 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-red-400 text-xl">⚠</span>
+          <h3 className="text-text text-sm font-semibold">Duplicate Document</h3>
+        </div>
+        <p className="text-dim text-sm leading-relaxed">
+          Duplicate document detected. The file '{fileName}' has already been uploaded in another section. Please upload a unique document.
+        </p>
+        <div className="flex justify-end mt-5">
+          <button
+            className="px-4 py-2 rounded-lg bg-amber/10 border border-amber/30 text-amber text-xs font-mono font-bold hover:bg-amber/20"
+            onClick={onClose}
+          >
+            OK
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function UploadPanel({ onUploaded }) {
   // State for each document type
   const [files, setFiles]     = useState({ srs: null, icd: null, supporting: null })
@@ -112,9 +143,23 @@ export default function UploadPanel({ onUploaded }) {
   const [errors,  setErrors]  = useState({ srs: '', icd: '', supporting: '' })
   const [sessions, setSessions] = useState({ srs: null, icd: null, supporting: null })
   const [preview, setPreview] = useState('')
+  const [duplicateFile, setDuplicateFile] = useState(null)
 
   const handleFile = useCallback(async (docTypeKey, f) => {
     if (!f) return
+
+    // Cross-section duplicate check: same file name must not exist under a different doc type
+    const isDuplicate = Object.entries(files).some(
+      ([key, existing]) =>
+        key !== docTypeKey &&
+        existing &&
+        existing.name.trim().toLowerCase() === f.name.trim().toLowerCase()
+    )
+    if (isDuplicate) {
+      setDuplicateFile(f.name)
+      return
+    }
+
     const ext = '.' + f.name.split('.').pop().toLowerCase()
     if (!ACCEPTED.includes(ext)) {
       setErrors(e => ({ ...e, [docTypeKey]: `Unsupported type: ${ext}. Use ${ACCEPTED.join(', ')}` }))
@@ -151,7 +196,7 @@ export default function UploadPanel({ onUploaded }) {
     } finally {
       setLoading(ld => ({ ...ld, [docTypeKey]: false }))
     }
-  }, [sessions, onUploaded])
+  }, [sessions, onUploaded, files])
 
   const handleClear = (docTypeKey) => {
     setFiles(fls => ({ ...fls, [docTypeKey]: null }))
@@ -162,6 +207,8 @@ export default function UploadPanel({ onUploaded }) {
 
   return (
     <div className="fade-in">
+      <DuplicateDocModal fileName={duplicateFile} onClose={() => setDuplicateFile(null)} />
+
       <div className="flex items-center gap-3 mb-4">
         <div className="w-7 h-7 rounded bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-sm font-mono font-bold">1</div>
         <h2 className="text-base font-semibold text-text">Upload Requirements</h2>

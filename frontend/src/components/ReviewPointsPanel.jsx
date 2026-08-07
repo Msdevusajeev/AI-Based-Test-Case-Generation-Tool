@@ -26,7 +26,7 @@ export const REVIEW_POINTS = [
   {
     id: 'rp6',
     label: 'Smart Requirement Merging',
-    desc: 'Analyse requirements for overlaps — merge related ones into a single test case covering both IDs',
+    desc: 'Analyse ALL requirements before generating. Group requirements that describe the same behaviour into ONE combined test case. Set traceability_req_id to comma-separated IDs of merged requirements (e.g. REQ_001, REQ_002). The NLP context payload contains detailed smart_merge_instructions — follow them exactly',
   },
 ]
 

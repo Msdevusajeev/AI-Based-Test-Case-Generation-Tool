@@ -2,6 +2,7 @@ import re
 from typing import List, Dict, Optional
 from models import DocumentChunk
 from constants import MODULE_KEYWORDS, FUNCTIONAL_VERBS, NON_FUNCTIONAL_KEYWORDS
+from icd_parser import parse_icd_signals, find_referenced_signals, to_icd_pipe_line
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -558,3 +559,41 @@ def ingest_document(text: str, chunk_size_words: int = 1500) -> List[DocumentChu
             notes_context    = extract_remarks_context(s, f"REQ-{i + 1:03d}"),
         ))
     return result
+
+
+# ─── ICD / SUPPORTING-DOCUMENT CROSS-REFERENCING ─────────────────────────────
+
+def attach_icd_context(
+    chunks: List[DocumentChunk],
+    icd_text: str = "",
+    supporting_text: str = "",
+) -> Dict[str, Dict]:
+    """
+    Cross-references every SRS requirement chunk against the ICD (and any
+    supporting document) so that input/output parameters named in the SRS
+    but only fully specified (data type, valid range, unit) in the ICD get
+    that specification attached.
+
+    For each chunk whose content mentions a signal defined in the ICD:
+      - chunk.icd_context is set to the canonical "Name | Type | Lo to Hi |
+        Unit" line(s) for every matched signal, appended to the content
+        that test_case_generator.py's ICD-range regexes already scan.
+      - chunk.icd_signals is set to the structured spec dict for those
+        signals, so BVA/ECP generation can run even when the SRS sentence
+        contains no explicit numeric comparison.
+
+    Mutates chunks in place and returns the full parsed signal table
+    (name -> spec) for logging/debugging.
+    """
+    all_signals = parse_icd_signals(icd_text, supporting_text)
+    if not all_signals:
+        return {}
+
+    for chunk in chunks:
+        matched = find_referenced_signals(chunk.content, all_signals)
+        if not matched:
+            continue
+        chunk.icd_signals = matched
+        chunk.icd_context = "\n".join(to_icd_pipe_line(spec) for spec in matched.values())
+
+    return all_signals

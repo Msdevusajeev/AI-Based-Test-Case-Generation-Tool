@@ -121,7 +121,14 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "test_cases": {
                         "type": "array",
-                        "description": "The AI-generated test cases with all required fields populated",
+                        "description": (
+                            "The AI-generated test cases with all required fields populated. "
+                            "Optionally include safety_level ('High'/'Low'), test_level "
+                            "('Unit'/'Integration'/'System'), and standard_reference "
+                            "(e.g. 'DO-178C Sec 6.4') per test case if the SRS/domain pack "
+                            "supports a specific classification — otherwise the tool defaults "
+                            "these from the session's selected domain."
+                        ),
                         "items": {"type": "object"}
                     },
                     "is_partial": {
@@ -190,61 +197,102 @@ async def call_tool(
 
     _debug_log(f"TOOL CALLED: {name}\n")
 
-    if name == "get_tool_status":
+    # Per-tool timeout ceiling — comfortably below Claude Desktop's own
+    # client-side MCP timeout (observed ~4 minutes) so a stuck spaCy
+    # cold-start, a hung backend call, or any other stall returns a clear
+    # JSON error payload instead of a silent hang that only ever surfaces
+    # as "Failed to call tool X" with nothing to diagnose from.
+    # ask_clarification is intentionally the longest: the backend already
+    # bounds its own wait at 300s (see _ask_clarification docstring), so
+    # this just needs to be a little longer than that, not shorter.
+    TOOL_TIMEOUTS = {
+        "get_generated_test_cases": 150,
+        "save_enhanced_test_cases": 90,
+        "generate_for_requirement": 90,
+        "ask_clarification":        310,
+    }
+
+    try:
+        if name == "get_tool_status":
+            result = json.dumps({
+                "status":   "running",
+                "engine":   "NLP extraction + Claude AI generation",
+                "version":  "2.0.0",
+                "mode":     "Claude Desktop MCP",
+                "strategy": (
+                    "NLP module extracts requirement sentences, subjects, actions, "
+                    "and classification metadata. Claude AI generates all test case "
+                    "fields from scratch using that structured context."
+                ),
+                "tools": [
+                    "get_generated_test_cases — extract NLP context for Claude AI to generate test cases",
+                    "save_enhanced_test_cases — save AI-generated results to React UI",
+                    "generate_for_requirement — extract NLP context for a single requirement in chat",
+                ]
+            }, indent=2)
+
+        elif name == "ask_clarification":
+            question = arguments.get("question", "")
+            options  = arguments.get("options") or None
+            loop     = asyncio.get_event_loop()
+            result   = await asyncio.wait_for(
+                loop.run_in_executor(None, _ask_clarification, question, options),
+                timeout=TOOL_TIMEOUTS[name],
+            )
+
+        elif name == "get_generated_test_cases":
+            _bi = int(arguments.get("batch_index", 0))
+            _bs = int(arguments.get("batch_size",  15))
+            loop   = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: _extract_nlp_context_for_queue(batch_index=_bi, batch_size=_bs)
+                ),
+                timeout=TOOL_TIMEOUTS[name],
+            )
+
+        elif name == "save_enhanced_test_cases":
+            test_cases = arguments.get("test_cases", [])
+            # Default True (safe: "more coming") not False (unsafe: silently finalizes).
+            # is_partial is required in the schema above, so this default should only
+            # ever be hit if an old cached tool schema is still loaded somewhere.
+            is_partial = bool(arguments.get("is_partial", True))
+            loop       = asyncio.get_event_loop()
+            result     = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: _save_enhanced_cases(test_cases, is_partial=is_partial)
+                ),
+                timeout=TOOL_TIMEOUTS[name],
+            )
+
+        elif name == "generate_for_requirement":
+            req_text = arguments.get("requirement_text", "")
+            req_id   = arguments.get("requirement_id", "REQ-001")
+            module   = arguments.get("module", "General")
+            loop     = asyncio.get_event_loop()
+            result   = await asyncio.wait_for(
+                loop.run_in_executor(None, _extract_and_generate_single, req_text, req_id, module),
+                timeout=TOOL_TIMEOUTS[name],
+            )
+
+        else:
+            result = json.dumps({"error": f"Unknown tool: {name}"})
+
+    except asyncio.TimeoutError:
+        limit = TOOL_TIMEOUTS.get(name, "?")
+        _debug_log(f"TOOL TIMEOUT: {name} exceeded {limit}s\n")
         result = json.dumps({
-            "status":   "running",
-            "engine":   "NLP extraction + Claude AI generation",
-            "version":  "2.0.0",
-            "mode":     "Claude Desktop MCP",
-            "strategy": (
-                "NLP module extracts requirement sentences, subjects, actions, "
-                "and classification metadata. Claude AI generates all test case "
-                "fields from scratch using that structured context."
+            "error": f"{name} timed out after {limit}s",
+            "likely_cause": (
+                "spaCy cold-start on the first NLP call after a server restart, or "
+                "the backend at BACKEND_URL is unreachable/slow. Call get_tool_status "
+                "first to confirm the server is responsive, then retry this call."
             ),
-            "tools": [
-                "get_generated_test_cases — extract NLP context for Claude AI to generate test cases",
-                "save_enhanced_test_cases — save AI-generated results to React UI",
-                "generate_for_requirement — extract NLP context for a single requirement in chat",
-            ]
-        }, indent=2)
-
-    elif name == "ask_clarification":
-        question = arguments.get("question", "")
-        options  = arguments.get("options") or None
-        loop     = asyncio.get_event_loop()
-        result   = await loop.run_in_executor(None, _ask_clarification, question, options)
-
-    elif name == "get_generated_test_cases":
-        _bi = int(arguments.get("batch_index", 0))
-        _bs = int(arguments.get("batch_size",  15))
-        loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: _extract_nlp_context_for_queue(batch_index=_bi, batch_size=_bs)
-        )
-
-    elif name == "save_enhanced_test_cases":
-        test_cases = arguments.get("test_cases", [])
-        # Default True (safe: "more coming") not False (unsafe: silently finalizes).
-        # is_partial is required in the schema above, so this default should only
-        # ever be hit if an old cached tool schema is still loaded somewhere.
-        is_partial = bool(arguments.get("is_partial", True))
-        loop       = asyncio.get_event_loop()
-        result     = await loop.run_in_executor(
-            None, lambda: _save_enhanced_cases(test_cases, is_partial=is_partial)
-        )
-
-    elif name == "generate_for_requirement":
-        req_text = arguments.get("requirement_text", "")
-        req_id   = arguments.get("requirement_id", "REQ-001")
-        module   = arguments.get("module", "General")
-        loop     = asyncio.get_event_loop()
-        result   = await loop.run_in_executor(
-            None, _extract_and_generate_single, req_text, req_id, module
-        )
-
-    else:
-        result = json.dumps({"error": f"Unknown tool: {name}"})
+        })
+    except Exception as e:
+        _debug_log(f"TOOL ERROR: {name}: {e!r}\n")
+        result = json.dumps({"error": f"{name} failed: {e}"})
 
     result = _with_clarification_reminder(result, name)
     return [types.TextContent(type="text", text=result)]
@@ -766,12 +814,19 @@ def _extract_nlp_context_for_queue(batch_index: int = 0, batch_size: int = 15) -
             "total_requirements": total_reqs,
             "smart_merge":        rp6_merge,
             "smart_merge_instructions": (
-                "SMART MERGING ACTIVE: Before generating, analyse ALL requirements in this batch. "
-                "Group requirements that describe the same behaviour or feature. "
-                "For each group: generate ONE combined test case covering all grouped requirements. "
-                "Set traceability_req_id = comma-separated IDs of all merged reqs (e.g. REQ_001, REQ_002). "
-                "For partially overlapping requirements: generate shared scenarios once, then add "
-                "gap-filling scenarios for uncovered parts only with their specific req ID."
+                "MANDATORY TWO-PHASE PROCESS — DO THIS BEFORE GENERATING ANY TEST CASES:\n"
+                "PHASE 1 — MERGE ANALYSIS (output this first, before any test cases):\n"
+                "  Look at every requirement_id in this batch.\n"
+                "  Output a merge plan like this:\n"
+                "  MERGE PLAN:\n"
+                "  - Group A: [REQ_001, REQ_002] — both describe window closure behaviour\n"
+                "  - Group B: [REQ_003] — standalone\n"
+                "  - Group C: [REQ_004, REQ_005] — both describe obstruction detection\n"
+                "PHASE 2 — GENERATE TEST CASES following the merge plan:\n"
+                "  For each GROUP with 2+ requirements: generate ONE test case.\n"
+                "  Set traceability_req_id = ALL IDs comma-separated: \"REQ_001, REQ_002\".\n"
+                "  For standalone requirements: generate normally.\n"
+                "  IMPORTANT: If you skip PHASE 1, you are not following instructions."
 ) if rp6_merge else None,
             "requirements":       requirements_context,
             "schema": {
@@ -1036,6 +1091,21 @@ def _extract_and_generate_single(req_text: str, req_id: str, module: str) -> str
 
 
 async def main():
+    # Warm up spaCy in the background as soon as the process starts, rather
+    # than paying the model-load cost inline during the first real
+    # get_generated_test_cases call. spaCy cold-start is the documented
+    # cause of MCP calls stalling long enough to hit Claude Desktop's own
+    # client-side timeout with no payload ever returned — loading it here
+    # means that cost lands during the handshake window, not inside a
+    # timed tool call.
+    try:
+        from test_case_generator import get_nlp
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, get_nlp)
+        _debug_log("spaCy warm-up scheduled at startup\n")
+    except Exception as e:
+        _debug_log(f"spaCy warm-up scheduling failed: {e!r}\n")
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,

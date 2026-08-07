@@ -123,6 +123,8 @@ function colN(tc) {
     edge:       'All inputs inactive simultaneously; conflicting or partial activation combinations tested.',
     robustness: 'Invalid/out-of-range inputs; missing signals; recovery after fault condition tested.',
     transition: 'State transitions tested: Inactive→Active, Active→Inactive, and partial activation sequences.',
+    invalid_input: "Input parameter's declared ICD valid range tested at and beyond its boundaries, "
+                   'including below-minimum and above-maximum invalid values.',
   }
   bullets.push(`• What is tested: ${scWhat[tc.scenario_type] || 'Functional system behaviour verified.'}`)
 
@@ -176,7 +178,7 @@ function colO(tc) { return moduleAlphaOnly(tc.module) }
 // ─── BADGE ──────────────────────────────────────────────────────────────────
 const BADGE_MAP = {
   testing_type:     { verification: 'badge-verification', validation: 'badge-validation', integration: 'badge-integration' },
-  scenario_type:    { normal: 'badge-normal', boundary: 'badge-boundary', edge: 'badge-edge', robustness: 'badge-robustness' },
+  scenario_type:    { normal: 'badge-normal', boundary: 'badge-boundary', edge: 'badge-edge', robustness: 'badge-robustness', invalid_input: 'badge-invalid_input' },
   test_environment: { Dev: 'badge-normal', QA: 'badge-boundary', UAT: 'badge-validation', Prod: 'badge-robustness' },
 }
 

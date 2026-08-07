@@ -12,6 +12,8 @@ const DEFAULT_RP = { rp1: true, rp2: true, rp3: true, rp4: true, rp5: true, rp6:
 // Customize > Skills, with Code execution and file creation enabled.
 const TC_SKILL_INSTRUCTION = "Use the general-tc-skill skill for test case generation. This skill defines the project's test case generation workflow, requirement classification guidelines, coverage strategy, and quality validation criteria to ensure consistent and comprehensive test case creation."
 const ACCEPTED   = ['.pdf', '.docx', '.xlsx', '.txt']
+const MAX_DOCS_PER_SECTION = 5   // cap for SRS / ICD multi-document upload
+const MAX_SUPPORTING_DOCS  = 10  // cap for Supporting Document multi-document upload
 
 // ─── tiny helpers ─────────────────────────────────────────────────────────────
 
@@ -20,6 +22,37 @@ function formatBytes(n) {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
+}
+
+// ─── Duplicate-document modal ───────────────────────────────────────────────
+
+function DuplicateDocModal({ fileName, sameSection, onClose }) {
+  if (!fileName) return null
+  const locationText = sameSection ? 'in this section' : 'in another section'
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div
+        className="bg-card border border-red-500/30 rounded-xl p-6 max-w-md w-full mx-4 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-red-400 text-xl">⚠</span>
+          <h3 className="text-text text-sm font-semibold">Duplicate Document</h3>
+        </div>
+        <p className="text-dim text-sm leading-relaxed">
+          Duplicate document detected. The file '{fileName}' has already been uploaded {locationText}. Please upload a unique document.
+        </p>
+        <div className="flex justify-end mt-5">
+          <button
+            className="px-4 py-2 rounded-lg bg-amber/10 border border-amber/30 text-amber text-xs font-mono font-bold hover:bg-amber/20"
+            onClick={onClose}
+          >
+            OK
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // ─── Upload drop-zone ─────────────────────────────────────────────────────────
@@ -97,10 +130,81 @@ function DropZone({ label, required, file, loading, error, onFile, onClear }) {
   )
 }
 
+// ─── Multi-document drop zone (used by SRS / ICD / Supporting) ───────────────
+// Same look & behaviour the Supporting-docs section already had: a list of
+// uploaded files plus an "add another" drop target, capped at maxFiles.
+
+function MultiDropZone({ list, maxFiles, label, required, error, loading, onFiles, onClear }) {
+  const inputId = `multi-input-${label.replace(/\s+/g, '-')}`
+  const items = list || []
+  const atLimit = items.length >= maxFiles
+
+  return (
+    <div className="space-y-2">
+      {loading && (
+        <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-border bg-card">
+          <div className="w-4 h-4 border-2 border-amber border-t-transparent rounded-full spin" />
+          <p className="text-dim text-xs">Uploading…</p>
+        </div>
+      )}
+      {items.map((f, idx) => (
+        <div key={idx} className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-green-500/30 bg-green-500/5">
+          <span className="text-xl">{f.name?.endsWith('.pdf') ? '📄' : f.name?.endsWith('.docx') ? '📝' : f.name?.endsWith('.txt') ? '📃' : '📊'}</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm text-text truncate">{f.name}</p>
+            <p className="text-xs text-green-400">✓ Uploaded</p>
+          </div>
+          <button onClick={() => onClear(idx)}
+            className="text-dim hover:text-red-400 transition-colors text-xs px-2 py-1 rounded hover:bg-red-500/10">
+            ✕
+          </button>
+        </div>
+      ))}
+
+      {!atLimit && (
+        <div
+          className="rounded-xl border-2 border-dashed border-border hover:border-amber/40 bg-card transition-all cursor-pointer"
+          onClick={() => document.getElementById(inputId).click()}
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => { e.preventDefault(); onFiles(Array.from(e.dataTransfer.files)) }}
+        >
+          <input id={inputId} type="file" accept=".pdf,.docx,.xlsx,.txt" multiple className="hidden"
+            onClick={e => { e.target.value = '' }}
+            onChange={e => { onFiles(Array.from(e.target.files)); e.target.value = '' }} />
+          <div className="p-4 flex items-center gap-4">
+            <div className="w-10 h-10 rounded-xl border border-border bg-surface flex items-center justify-center text-xl flex-shrink-0">📋</div>
+            <div>
+              <p className="text-sm text-text font-medium">
+                {items.length > 0 ? 'Add another document' : `Drop ${label} here or`}&nbsp;
+                <span className="text-amber underline">Click to browse</span>
+              </p>
+              <div className="flex items-center gap-2 mt-1">
+                {ACCEPTED.map(e => (
+                  <span key={e} className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">{e}</span>
+                ))}
+                <span className="text-[10px] text-dim/60 ml-1">
+                  {Number.isFinite(maxFiles) ? `Up to ${maxFiles} files` : 'Multiple files supported'}
+                  {required ? ' · at least 1 required' : ''}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {atLimit && (
+        <p className="text-[10px] text-dim/60 px-1">Maximum of {maxFiles} documents reached. Remove one to add another.</p>
+      )}
+
+      {error && <p className="px-1 text-xs text-red-400">⚠ {error}</p>}
+    </div>
+  )
+}
+
 // ─── Page: Upload ─────────────────────────────────────────────────────────────
 
-function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefixes, onReqPrefixesChange }) {
-  const srsReady    = !!files.srs
+function PageUpload({ files, loading, errors, onFiles, onClear, onNext, reqPrefixes, onReqPrefixesChange }) {
+  const srsReady    = (files.srsList || []).length > 0
   // REQ prefix is valid only if it resolves to at least one non-empty token
   const prefixReady = reqPrefixes.split(',').map(p => p.trim()).filter(Boolean).length > 0
   const canProceed  = srsReady && prefixReady
@@ -119,9 +223,10 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
             <span className="text-sm text-text font-medium">Software Requirements Specification</span>
             <span className="text-xs text-red-400/80 ml-1">* Mandatory</span>
           </div>
-          <DropZone label="SRS document" required
-            file={files.srs} loading={loading.srs} error={errors.srs}
-            onFile={f => onFile('srs', f)} onClear={() => onClear('srs')} />
+          <MultiDropZone
+            label="SRS document" required maxFiles={MAX_DOCS_PER_SECTION}
+            list={files.srsList} error={errors.srs} loading={loading.srs}
+            onFiles={arr => onFiles('srs', arr)} onClear={idx => onClear('srs', idx)} />
         </div>
 
         {/* Requirement ID Prefix */}
@@ -165,9 +270,10 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
             <span className="text-sm text-text font-medium">Interface Control Document</span>
             <span className="text-xs text-dim ml-1">optional</span>
           </div>
-          <DropZone label="ICD document"
-            file={files.icd} loading={loading.icd} error={errors.icd}
-            onFile={f => onFile('icd', f)} onClear={() => onClear('icd')} />
+          <MultiDropZone
+            label="ICD document" maxFiles={MAX_DOCS_PER_SECTION}
+            list={files.icdList} error={errors.icd} loading={loading.icd}
+            onFiles={arr => onFiles('icd', arr)} onClear={idx => onClear('icd', idx)} />
         </div>
 
         {/* Supporting */}
@@ -183,49 +289,11 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
             </div>
             <span className="text-xs text-dim ml-1">optional</span>
           </div>
-          {/* Multi supporting documents */}
-          <div className="space-y-2">
-            {(files.supportingList || []).map((f, idx) => (
-              <div key={idx} className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-green-500/30 bg-green-500/5">
-                <span className="text-xl">{f.name?.endsWith('.pdf') ? '📄' : f.name?.endsWith('.docx') ? '📝' : f.name?.endsWith('.txt') ? '📃' : '📊'}</span>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-text truncate">{f.name}</p>
-                  <p className="text-xs text-green-400">✓ Uploaded</p>
-                </div>
-                <button onClick={() => onClear('supporting', idx)}
-                  className="text-dim hover:text-red-400 transition-colors text-xs px-2 py-1 rounded hover:bg-red-500/10">
-                  ✕
-                </button>
-              </div>
-            ))}
-            <div
-              className="rounded-xl border-2 border-dashed border-border hover:border-amber/40 bg-card transition-all cursor-pointer"
-              onClick={() => document.getElementById('sup-input').click()}
-              onDragOver={e => e.preventDefault()}
-              onDrop={e => { e.preventDefault(); Array.from(e.dataTransfer.files).forEach(f => onFile('supporting', f)) }}
-            >
-              <input id="sup-input" type="file" accept=".pdf,.docx,.xlsx,.txt" multiple className="hidden"
-                onClick={e => { e.target.value = '' }}
-              onChange={e => Array.from(e.target.files).forEach(f => onFile('supporting', f))} />
-              <div className="p-4 flex items-center gap-4">
-                <div className="w-10 h-10 rounded-xl border border-border bg-surface flex items-center justify-center text-xl flex-shrink-0">📋</div>
-                <div>
-                  <p className="text-sm text-text font-medium">
-                    {(files.supportingList||[]).length > 0 ? 'Add another document' : 'Drop supporting documents here or'}&nbsp;
-                    <span className="text-amber underline">Click to browse</span>
-                  </p>
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.pdf</span>
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.docx</span>
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.xlsx</span>
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-border text-dim">.txt</span>
-                    <span className="text-[10px] text-dim/60 ml-1">Multiple files supported</span>
-                  </div>
-                </div>
-              </div>
-              {errors.supporting && <p className="px-4 pb-3 text-xs text-red-400">⚠ {errors.supporting}</p>}
-            </div>
-          </div>
+          {/* Multi supporting documents — capped at MAX_SUPPORTING_DOCS */}
+          <MultiDropZone
+            label="supporting documents" maxFiles={MAX_SUPPORTING_DOCS}
+            list={files.supportingList} error={errors.supporting}
+            onFiles={arr => onFiles('supporting', arr)} onClear={idx => onClear('supporting', idx)} />
         </div>
       </div>
 
@@ -245,12 +313,35 @@ function PageUpload({ files, loading, errors, onFile, onClear, onNext, reqPrefix
 
 // ─── Page: Configure ──────────────────────────────────────────────────────────
 
-function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, onRpChange, customReviewPoints, onCustomReviewPointsChange, generating, onBack, onGenerate, onNext, reqPrefixes }) {
+function PageConfigure({ sessionId, scopeConfig, onScopeChange, reviewPoints, onRpChange, customReviewPoints, onCustomReviewPointsChange, generating, onBack, onGenerate, onNext, reqPrefixes, domain, onDomainChange }) {
+  const DOMAIN_OPTIONS = [
+    { value: 'avionics',   label: 'Avionics (DO-178C)' },
+    { value: 'automotive', label: 'Automotive (ISO 26262)' },
+    { value: 'healthcare', label: 'Healthcare (IEC 62304)' },
+    { value: 'general',    label: 'General (ISO/IEC/IEEE 29119)' },
+  ]
   return (
     <div className="max-w-5xl mx-auto px-6 py-8">
       <div className="mb-8">
         <h2 className="text-xl font-semibold text-text">Configure Generation</h2>
         <p className="text-sm text-dim mt-1">Select which requirements to target and choose your review points.</p>
+      </div>
+
+      {/* Domain — defaults Safety_Level / Test_Level / Standard_Reference */}
+      <div className="bg-card border border-border rounded-2xl p-5 mb-6">
+        <div className="flex items-center gap-2 mb-3">
+          <div className="w-6 h-6 rounded-lg bg-amber/10 border border-amber/30 flex items-center justify-center text-amber text-xs">🏷</div>
+          <h3 className="text-sm font-semibold text-text">Domain</h3>
+          <span className="text-xs text-dim ml-1">— sets default Safety_Level / Test_Level / Standard_Reference (editable per test case after generation)</span>
+        </div>
+        <select
+          value={domain}
+          onChange={e => onDomainChange(e.target.value)}
+          disabled={generating}
+          className="bg-surface border border-border text-dim text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-amber/50 cursor-pointer"
+        >
+          {DOMAIN_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -828,7 +919,7 @@ function PageExport({ testCases, summary, sessionId, exportSource }) {
               testCases if this summary predates the backend field. */}
           {summary && (() => {
             const CORE = ['normal', 'boundary', 'edge', 'robustness']
-            const ADV_LABELS = { mcdc: 'MC/DC', beyond_range: 'Beyond-Range', fault: 'Fault Injection', timing: 'Timing' }
+            const ADV_LABELS = { mcdc: 'MC/DC', beyond_range: 'Beyond-Range', fault: 'Fault Injection', timing: 'Timing', invalid_input: 'ICD Invalid-Range' }
             let depth = summary.verification_depth
             if (!depth) {
               const byReq = {}
@@ -942,20 +1033,33 @@ export default function App() {
   const [tab, setTab] = useState('upload')
 
   // Upload
-  const [files,    setFiles]    = useState({ srs: null, icd: null, supporting: null, supportingList: [] })
+  // srsList / icdList: up to MAX_DOCS_PER_SECTION docs each, [{name, session_id}]
+  const [files,    setFiles]    = useState({ srsList: [], icdList: [], supportingList: [] })
   const [loading,  setLoading]  = useState({ srs: false, icd: false, supporting: false })
   const [errors,   setErrors]   = useState({ srs: '', icd: '', supporting: '' })
+  // sessions.srs / sessions.icd hold the single (possibly merged) session that
+  // downstream /api/generate, /api/generate/ai, /api/scope calls consume —
+  // unchanged contract, just now potentially backed by several source files.
   const [sessions, setSessions] = useState({ srs: null, icd: null, supporting: null })
   const [uploadData, setUploadData] = useState(null)
+  const [duplicateFile, setDuplicateFile] = useState(null)
+  const [duplicateSameSection, setDuplicateSameSection] = useState(false)
 
   const sessionsRef = useRef(sessions)
   sessionsRef.current = sessions
+  const filesRef = useRef(files)
+  filesRef.current = files
 
   // Config
   const [reqPrefixes,     setReqPrefixes]     = useState('')
   const [scopeConfig,     setScopeConfig]     = useState({ selectedReqIds: null, selectedModule: null, selectedModules: null })
   const [reviewPoints,    setReviewPoints]    = useState(DEFAULT_RP)
   const [customReviewPoints, setCustomReviewPoints] = useState([])
+  // Domain selector — defaults Safety_Level / Test_Level / Standard_Reference
+  // in the standardized Test Case Template (see constants.DOMAIN_DEFAULTS on
+  // the backend). This is a starting point for review, not a per-requirement
+  // DAL/ASIL classification — editable per-TC after generation.
+  const [domain, setDomain] = useState('general')
 
   // Generation
   const [generating, setGenerating] = useState(false)
@@ -1099,11 +1203,82 @@ export default function App() {
   }, [handleMcpResult])
 
   // ── upload ──────────────────────────────────────────────────────────────────
+
+  // Combine 1..N /api/upload session_ids of the same doc_type into the single
+  // session_id the rest of the app already knows how to consume. With exactly
+  // one id, this is a no-op pass-through (existing single-document behaviour
+  // is untouched) — /api/merge_sessions itself special-cases that too.
+  const mergeSessions = useCallback(async (sessionIds, docType) => {
+    if (sessionIds.length === 1) return { session_id: sessionIds[0] }
+    const res = await fetch('/api/merge_sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_ids: sessionIds, doc_type: docType }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data?.detail?.error || 'Merge failed')
+    return data
+  }, [])
+
+  // Recomputes the merged session for a multi-file section (srs/icd) from its
+  // current file list and pushes it into `sessions` / `uploadData`, mirroring
+  // exactly what a single /api/upload response used to populate.
+  const applyMergedDoc = useCallback(async (type, list) => {
+    const merged = list.length ? await mergeSessions(list.map(item => item.session_id), type) : null
+    const next = { ...sessionsRef.current, [type]: merged }
+    setSessions(next)
+    if (type === 'srs') {
+      if (merged) {
+        setUploadData(prev => ({
+          session_id:             merged.session_id,
+          icd_session_id:         next.icd?.session_id        || null,
+          supporting_session_id:  next.supporting?.session_id || null,
+          supporting_session_ids: (prev || {}).supporting_session_ids || [],
+        }))
+        setTestCases([]); setSummary(null); setError('')
+      } else {
+        setUploadData(null); setTestCases([]); setSummary(null)
+      }
+    } else if (type === 'icd') {
+      setUploadData(prev => prev ? { ...prev, icd_session_id: merged?.session_id || null } : prev)
+    }
+  }, [mergeSessions])
+
   const handleFile = useCallback(async (type, f) => {
     if (!f) return
+
+    // Duplicate check: the same file name must not already exist anywhere —
+    // whether in this same section's list (SRS/ICD allow up to 5 docs each)
+    // or in one of the other two sections (SRS / ICD / Supporting).
+    const normalize = (n) => n.trim().toLowerCase()
+    const sectionLists = {
+      srs: filesRef.current.srsList || [],
+      icd: filesRef.current.icdList || [],
+      supporting: filesRef.current.supportingList || [],
+    }
+    const isDuplicateSameSection = (sectionLists[type] || []).some(item => normalize(item.name) === normalize(f.name))
+    const isDuplicate = Object.values(sectionLists).some(
+      list => list.some(item => normalize(item.name) === normalize(f.name))
+    )
+    if (isDuplicate) {
+      setDuplicateFile(f.name)
+      setDuplicateSameSection(isDuplicateSameSection)
+      return
+    }
+
     const ext = '.' + f.name.split('.').pop().toLowerCase()
     if (!ACCEPTED.includes(ext)) {
       setErrors(e => ({ ...e, [type]: `Unsupported: ${ext}` })); return
+    }
+    // Per-file backstop (the real gate is the batch check in handleFiles below,
+    // which runs before any of these individual uploads are even kicked off).
+    const maxForType = type === 'supporting' ? MAX_SUPPORTING_DOCS : MAX_DOCS_PER_SECTION
+    if (type === 'srs' || type === 'icd' || type === 'supporting') {
+      const current = filesRef.current[`${type}List`] || []
+      if (current.length >= maxForType) {
+        setErrors(e => ({ ...e, [type]: `You are uploading more than ${maxForType} documents. Please upload a maximum of ${maxForType} documents only.` }))
+        return
+      }
     }
     setErrors(e => ({ ...e, [type]: '' }))
     setLoading(ld => ({ ...ld, [type]: true }))
@@ -1112,8 +1287,14 @@ export default function App() {
       const res  = await fetch('/api/upload', { method: 'POST', body: form })
       const data = await res.json()
       if (!res.ok) throw new Error(data?.detail?.error || 'Upload failed')
-      if (type === 'supporting') {
-        // Multi-file: append to list
+
+      if (type === 'srs' || type === 'icd') {
+        const listKey  = `${type}List`
+        const newList  = [...(filesRef.current[listKey] || []), { name: f.name, session_id: data.session_id }]
+        setFiles(fs => ({ ...fs, [listKey]: newList }))
+        await applyMergedDoc(type, newList)
+      } else if (type === 'supporting') {
+        // Multi-file: append to list — unchanged existing behaviour
         setFiles(fs => ({
           ...fs,
           supportingList: [...(fs.supportingList || []), { name: f.name, session_id: data.session_id }]
@@ -1128,31 +1309,56 @@ export default function App() {
             supporting_session_ids: [...((prev||{}).supporting_session_ids||[]), data.session_id].filter(Boolean),
           }))
         }
-      } else {
-        setFiles(fs => ({ ...fs, [type]: f }))
-        const next = { ...sessionsRef.current, [type]: data }
-        setSessions(next)
-        if (next.srs) {
-          setUploadData(prev => ({
-            ...next.srs,
-            icd_session_id:         next.icd?.session_id        || null,
-            supporting_session_id:  next.supporting?.session_id || null,
-            supporting_session_ids: (prev||{}).supporting_session_ids || [],
-          }))
-          if (type === 'srs') { setTestCases([]); setSummary(null); setError('') }
-        }
       }
     } catch (e) {
       setErrors(err => ({ ...err, [type]: e.message }))
-      if (type !== 'supporting') setFiles(fs => ({ ...fs, [type]: null }))
     } finally {
       setLoading(ld => ({ ...ld, [type]: false }))
     }
-  }, [])
+  }, [applyMergedDoc])
+
+  // Batch gate: runs BEFORE any individual upload starts. This is the actual
+  // fix — validating count inside handleFile alone doesn't work for a
+  // multi-select or multi-drop, because all files in the batch fire against
+  // the same pre-update snapshot of filesRef.current in the same tick, so a
+  // per-file check can't see files that are "still in flight" from siblings
+  // in the same batch. Reject the whole batch atomically instead.
+  const handleFiles = useCallback((type, fileList) => {
+    const arr = Array.from(fileList || []).filter(Boolean)
+    if (arr.length === 0) return
+
+    const max = type === 'supporting' ? MAX_SUPPORTING_DOCS : MAX_DOCS_PER_SECTION
+    const currentCount = (filesRef.current[`${type}List`] || []).length
+
+    if (currentCount + arr.length > max) {
+      setErrors(e => ({
+        ...e,
+        [type]: `You are uploading more than ${max} documents. Please upload a maximum of ${max} documents only.`
+      }))
+      return
+    }
+
+    setErrors(e => ({ ...e, [type]: '' }))
+    // Process sequentially (not Promise.all) so each upload's state update
+    // commits — and filesRef.current updates — before the next one reads it.
+    ;(async () => {
+      for (const f of arr) {
+        await handleFile(type, f)
+      }
+    })()
+  }, [handleFile])
 
   const handleClear = (type, idx) => {
     if (type === 'supporting' && idx !== undefined) {
       setFiles(fs => ({ ...fs, supportingList: fs.supportingList.filter((_, i) => i !== idx) }))
+      return
+    }
+    if ((type === 'srs' || type === 'icd') && idx !== undefined) {
+      const listKey = `${type}List`
+      const newList = (filesRef.current[listKey] || []).filter((_, i) => i !== idx)
+      setFiles(fs => ({ ...fs, [listKey]: newList }))
+      setErrors(e => ({ ...e, [type]: '' }))
+      applyMergedDoc(type, newList)
       return
     }
     setFiles(fs => ({ ...fs, [type]: null, ...(type === 'supporting' ? { supportingList: [] } : {}) }))
@@ -1181,6 +1387,7 @@ export default function App() {
           selected_module:       scopeConfig.selectedModule  || null,
           selected_modules:      scopeConfig.selectedModules || null,
           req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
+          domain:                domain,
         }),
       })
       const data = await res.json()
@@ -1208,6 +1415,9 @@ export default function App() {
           selected_module:       scopeConfig.selectedModule  || null,
           selected_modules:      scopeConfig.selectedModules || null,
           req_prefixes:          reqPrefixes.trim() ? reqPrefixes.split(',').map(p => p.trim()).filter(Boolean) : null,
+          review_points:        reviewPoints,
+          custom_review_points: customReviewPoints.map(p => p.label),
+          domain:               domain,
         }),
       })
       const qData = await qRes.json()
@@ -1252,6 +1462,17 @@ export default function App() {
         ...(checklistItems.length > 0
           ? ['', 'Generation Checklist:', ...checklistItems]
           : ['', 'Generation Checklist: none provided for this run — apply the standard project rules only.']),
+        ...(reviewPoints.rp6 ? [
+          '',
+          '⚠ SMART MERGING IS ENABLED — MANDATORY TWO-PHASE PROCESS:',
+          'PHASE 1 (do this first): After calling get_generated_test_cases, output a MERGE PLAN showing which requirements you will combine. Example:',
+          '  MERGE PLAN: Group A: [REQ_001, REQ_002] - same behaviour | Group B: [REQ_003] - standalone',
+          'PHASE 2: Generate test cases following your merge plan.',
+          '  - For each group with 2+ requirements: ONE test case with traceability_req_id = "REQ_001, REQ_002"',
+          '  - For standalone requirements: generate normally',
+          'The NLP context also contains smart_merge_instructions — follow both.',
+          'DO NOT generate test cases individually if Smart Merging is enabled.',
+        ] : []),
       ]
 
       const step6Lines = isMultiBatch
@@ -1281,6 +1502,7 @@ export default function App() {
         '',
         'Step 5 – Mandatory Test Case Fields',
         'Every generated test case must include the following attributes: traceability_req_id, test_case_id, scenario_id, inputs (e.g., ["SignalName = Value"]), expected_outcome (e.g., "OutputSignal = Value"), design_methodology, testing_type, scenario_type, priority, objective, preconditions, test_steps, dependent_test_cases, test_environment, remarks, module.',
+        `If you can determine it from the SRS/domain pack in use, also include: safety_level ("High"/"Low"), test_level ("Unit"/"Integration"/"System"), standard_reference (e.g. "DO-178C Sec 6.4" or "ISO 26262-6 Table 12"). These are optional per-test-case overrides — if omitted, the tool defaults them from the selected domain ("${domain}").`,
         '',
         'Step 6 – Save Generated Test Cases',
         ...step6Lines,
@@ -1324,6 +1546,7 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-bg text-text font-sans overflow-hidden">
+      <DuplicateDocModal fileName={duplicateFile} sameSection={duplicateSameSection} onClose={() => setDuplicateFile(null)} />
 
       {/* ── Top bar ── */}
       <header className="flex-shrink-0 border-b border-border bg-surface z-10">
@@ -1384,7 +1607,7 @@ export default function App() {
         {tab === 'upload' && (
           <PageUpload
             files={files} loading={loading} errors={errors}
-            onFile={handleFile} onClear={handleClear}
+            onFiles={handleFiles} onClear={handleClear}
             onNext={() => setTab('configure')}
             reqPrefixes={reqPrefixes}
             onReqPrefixesChange={setReqPrefixes}
@@ -1402,6 +1625,7 @@ export default function App() {
             onBack={() => setTab('upload')}
             onGenerate={handleGenerate}
             onNext={() => setTab('generate')}
+            domain={domain} onDomainChange={setDomain}
           />
         )}
 

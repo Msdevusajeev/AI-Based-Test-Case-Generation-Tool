@@ -194,6 +194,44 @@ PRECONDITION_TEMPLATES = {
 #  EXPECTED OUTCOME TEMPLATES
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+#  DOMAIN DEFAULTS — Template columns 14/15/19
+#  (Safety_Level, Test_Level, Standard_Reference)
+# ─────────────────────────────────────────────
+# These are SESSION-LEVEL defaults selected by the user at generation time
+# (see GenerateRequest.domain). They are NOT derived from requirement text —
+# the tool has no per-requirement DAL/ASIL classification today, so guessing
+# per-TC would fabricate safety data on a DO-178C/ISO 26262 artifact.
+# Values are editable after generation (GUI + Excel); this is a starting
+# point, not a substitute for domain engineer sign-off.
+DOMAIN_DEFAULTS = {
+    "avionics": {
+        "safety_level":       "High",
+        "test_level":         "System",
+        "standard_reference": "DO-178C",
+    },
+    "automotive": {
+        "safety_level":       "High",
+        "test_level":         "System",
+        "standard_reference": "ISO 26262",
+    },
+    "healthcare": {
+        "safety_level":       "High",
+        "test_level":         "System",
+        "standard_reference": "IEC 62304",
+    },
+    "general": {
+        "safety_level":       "Low",
+        "test_level":         "System",
+        "standard_reference": "ISO/IEC/IEEE 29119",
+    },
+}
+
+# Override test_level to "Integration" whenever the TC's coverage type is
+# integration — applies uniformly regardless of domain.
+TEST_LEVEL_INTEGRATION_OVERRIDE = "Integration"
+
+
 EXPECTED_OUTCOME_TEMPLATES = {
     "normal": (
         "System successfully executes {action} with valid inputs. "

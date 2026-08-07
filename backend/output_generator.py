@@ -1,30 +1,30 @@
 """
 output_generator.py
-Generates Excel output strictly matching One_TC_Updated.xlsx template format.
+Generates Excel/GUI output using the standardized Test Case Template
+column structure (19 mandatory columns, fixed order):
 
-Exact column layout (matches template):
-  A(1)   Requirement_ID
-  B(2)   TC_ID
-  C(3)   Scenario No          -- format: SC_001, SC_002 ...
-  D(4)   Test Objective
-  E(5)   Test Details Description
-  F(6)   Test Precondition     -- Req 5: consolidates E + input-related Test Steps from H col
-  G(7)   Inputs               -- merged header over sub-signal columns H, I, ...
-  H(8)+  [input signal sub-columns, dynamic]
-  J(10)  Test Steps           -- standalone column (after input sub-cols)
-  K(11)  Expected Outputs     -- merged header over output signal sub-columns
-  L(12)+ [output signal sub-columns, dynamic]
-  M(13)  Depends On           -- TC_ID + Scenario No concatenated (Req 10)
-  N(14)  Test_Env
-  O(15)  Test_Type
-  P(16)  Scenario_Type
-  Q(17)  Remarks/Additional information  -- bullet format, no test-basis (Req 8)
-  R(18)  Module               -- alpha-only (Req 7)
+   1  Requirement_ID
+   2  TC_ID                    -- merged test_case_id + scenario_id
+   3  Test Objective
+   4  Test Details Description
+   5  Test Pre-Condition
+   6  Inputs                   -- single consolidated field: "Input1=Value1; Input2=Value2"
+   7  Test Steps
+   8  Requirement_Type         -- Functional / Non-Functional
+   9  Coverage_Type            -- Validation / Verification / Integration
+  10  Test_Level               -- Unit / Integration / System
+  11  Scenario_Type            -- passed through from the underlying generator
+  12  Expected Outputs         -- single consolidated field: "Output1=Value1; Output2=Value2"
+  13  Module
+  14  Safety_Level             -- High / Low (domain default, editable)
+  15  Priority                 -- P1 / P2 / P3
+  16  PASS/FAIL Criteria
+  17  Configure_Baseline       -- kept blank
+  18  Remarks
+  19  Standard_Reference       -- domain document name (domain default, editable)
 
-  NOTE: Column positions G/J/K/M etc. shift right if there are more input/output signals.
-  The template example has 3 input signals and 2 output signals, giving:
-    G(7)=Inputs header, H(8)=sig1, I(9)=sig2, [J(10)=sig3 if 3 inputs]
-  Since signals are dynamic, we compute offsets at runtime.
+No more dynamic per-signal sub-columns: Inputs and Expected Outputs are each
+a single column now (see _consolidated_inputs / _consolidated_outputs).
 """
 
 import io
@@ -42,6 +42,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from models import TestCase
 from config import ENGINE
+from constants import DOMAIN_DEFAULTS, TEST_LEVEL_INTEGRATION_OVERRIDE
 
 
 # ─── STYLING — Uniform colour scheme (Requirement 6) ─────────────────────────
@@ -71,22 +72,6 @@ _KV_COLON = re.compile(r'^(.+?):\s*(.+)$')
 _KV_EQUAL  = re.compile(r'^(.+?)\s*=\s*(.+)$')
 
 # TC methodologies that always produce proper "SignalName: Value" inputs
-_SIGNAL_METHODOLOGIES = {
-    "mc/dc testing",
-    "condition coverage testing",
-    "decision table testing",
-}
-
-# Generic phrases that disqualify an input entry as a named signal
-_GENERIC_INPUT_PHRASES = {
-    "valid data", "invalid data", "boundary value", "valid inputs",
-    "sql injection", "xss payload", "malformed", "oversized input",
-    "concurrent request", "session timeout", "state transition",
-    "out-of-range", "sub-requirements scope", "combined inputs",
-    "conforming to srs", "test environment", "all prerequisite",
-    "exercising the full", "satisfying all sub",
-}
-
 # Phrases that disqualify an output signal name
 _OUTPUT_SKIP_PHRASES = {
     "system successfully", "response is", "data is", "result is",
@@ -164,69 +149,6 @@ def _has_numeric_inputs(tc: TestCase) -> bool:
         if v.replace(".", "", 1).isdigit():
             return True
     return False
-
-
-def _is_valid_input_signal(entry: str, is_signal_tc: bool) -> bool:
-    """
-    Returns True if entry is a proper named signal input.
-    Accepts both:
-      "SignalName: Value"   (rule-based engine format)
-      "SignalName = Value"  (Claude AI generated format)
-
-    Each input entry is treated as an independent signal regardless of
-    methodology — name and value are never combined into a single cell.
-    The is_signal_tc flag is retained for API compatibility but no longer
-    restricts which entries qualify; the name-validity check alone gates entry.
-    """
-    if ':' not in entry and '=' not in entry:
-        return False
-    name, value = _parse_signal_value(entry)
-    if not name or not value:
-        return False
-    # Name must be 1-8 words
-    if not (1 <= len(name.split()) <= 8):
-        return False
-    # Name must not be a generic phrase
-    name_lower = name.lower()
-    if any(phrase in name_lower for phrase in _GENERIC_INPUT_PHRASES):
-        return False
-    # Accept all Name:Value / Name=Value entries as independent signals.
-    # Values of any length (enum, boolean, short prose) are valid —
-    # the column header is the signal name and the cell holds the value.
-    return True
-
-
-def _parse_output_clause(clause: str) -> List[Tuple[str, str]]:
-    """
-    Parses a clause like "Signal1 = Value1; Signal2 = Value2"
-    into [("Signal1", "Value1"), ("Signal2", "Value2")].
-    Skips entries where the name is a generic phrase.
-    """
-    results = []
-    # Split on semicolons to handle multiple signals
-    parts_list = clause.split(";")
-    for part in parts_list:
-        part = part.strip()
-        if "=" not in part:
-            continue
-        parts = part.split("=", 1)
-        if len(parts) != 2:
-            continue
-        raw_name  = parts[0].strip()
-        value_raw = parts[1].strip()
-        name  = re.sub(r'^(?:the|a|an|this)\s+', '', raw_name, flags=re.IGNORECASE).strip()
-        value = value_raw.split()[0].rstrip(".,;:") if value_raw else ""
-        if not name or len(name) < 2 or not value:
-            continue
-        words = name.split()
-        if not (1 <= len(words) <= 8):
-            continue
-        if words[0].lower() in _OUTPUT_STARTER_SKIP:
-            continue
-        if any(p in name.lower() for p in _OUTPUT_SKIP_PHRASES):
-            continue
-        results.append((name, value))
-    return results
 
 
 def _extract_all_output_signals_with_values(
@@ -333,19 +255,6 @@ def _extract_all_output_signals_with_values(
     return results
 
 
-def _extract_all_output_signals(
-    expected_outcome: str,
-    exclude_names: set = None,
-) -> List[str]:
-    """Returns list of output signal names (without values)."""
-    return [
-        name
-        for name, _ in _extract_all_output_signals_with_values(
-            expected_outcome, exclude_names=exclude_names
-        )
-    ]
-
-
 def _extract_output_signal(expected_outcome: str) -> Tuple[str, str]:
     """
     Extracts (signal_name, value) from expected_outcome.
@@ -441,91 +350,6 @@ def _normalise_signal_name(name: str) -> str:
     return s
 
 
-def extract_signal_columns(test_cases: List[TestCase]) -> Tuple[List[str], List[str]]:
-    """
-    Returns (input_signal_names, output_signal_names) for the given test cases.
-
-    Input signals:
-      Every "Name: Value" or "Name = Value" entry in tc.inputs is treated as
-      an independent signal and gets its own dedicated sub-column in the Excel
-      sheet.  Input names are collected in first-seen order across all TCs.
-
-      Deduplication uses a normalised key (lowercase + collapsed whitespace +
-      stripped scenario-type qualifiers) so the same physical signal appearing
-      with minor casing/spacing/suffix variants across different scenario TCs
-      maps to a single column — not to separate duplicate columns.
-
-    Output signals:
-      Extracted from the first clause of expected_outcome using "SignalName = Value"
-      format.
-    """
-    in_sigs:     List[str] = []   # canonical (first-seen) signal names
-    out_sigs:    List[str] = []
-    seen_in_key: set = set()      # normalised keys to prevent duplicate columns
-    seen_out:    set = set()
-
-    for tc in test_cases:
-        # is_signal_tc kept for _is_valid_input_signal API; all entries now
-        # treated independently regardless of methodology.
-        is_signal_tc = tc.design_methodology.lower() in _SIGNAL_METHODOLOGIES
-
-        # ── Input signals ──────────────────────────────────────────────────────
-        for entry in tc.inputs:
-            if not _is_valid_input_signal(entry, is_signal_tc):
-                continue
-            name, _ = _parse_signal_value(entry)
-            if not name:
-                continue
-            # Use a normalised key for dedup so case/whitespace/suffix variants
-            # of the same signal name don't produce separate columns.
-            norm_key = _normalise_signal_name(name)
-            if norm_key not in seen_in_key:
-                seen_in_key.add(norm_key)
-                in_sigs.append(name)   # store the first-seen form as the column header
-
-        # ── Output signals ─────────────────────────────────────────────────────
-        # Pass seen_in_key (as lowercase names) to exclude input signal names
-        # from output detection.
-        for sig_name, _ in _extract_all_output_signals_with_values(
-            tc.expected_outcome, exclude_names={k for k in seen_in_key}
-        ):
-            norm_out = _normalise_signal_name(sig_name)
-            if norm_out not in seen_out:
-                seen_out.add(norm_out)
-                out_sigs.append(sig_name)
-
-    return in_sigs, out_sigs
-
-
-def _get_signal_value(tc: TestCase, signal_name: str, kind: str) -> str:
-    """
-    Returns the value for a specific signal from a test case.
-
-    Matching uses the normalised signal name (_normalise_signal_name) so
-    that casing, whitespace, and scenario-type suffix variants in Claude AI
-    output still resolve to the correct column.
-    """
-    norm_target = _normalise_signal_name(signal_name)
-    if kind == "input":
-        for entry in tc.inputs:
-            name, value = _parse_signal_value(entry)
-            if _normalise_signal_name(name) == norm_target:
-                return value
-        return ""
-    # Output: search in expected_outcome, excluding input signal names
-    input_names = set()
-    for entry in tc.inputs:
-        n, _ = _parse_signal_value(entry)
-        if n:
-            input_names.add(_normalise_signal_name(n))
-    for sname, sval in _extract_all_output_signals_with_values(
-        tc.expected_outcome, exclude_names=input_names
-    ):
-        if _normalise_signal_name(sname) == norm_target:
-            return sval
-    return ""
-
-
 # ─── FIELD HELPERS ────────────────────────────────────────────────────────────
 
 def _list_to_str(value) -> str:
@@ -534,19 +358,10 @@ def _list_to_str(value) -> str:
     return str(value) if value else ""
 
 
-def _cell_value(tc: TestCase, field: str) -> str:
-    return _list_to_str(getattr(tc, field, ""))
-
-
 def _module_alpha_only(module: str) -> str:
     """Requirement 7: keep only alphabetical characters and spaces."""
     cleaned = re.sub(r'[^A-Za-z\s]', '', module).strip()
     return re.sub(r'\s+', ' ', cleaned) or "General"
-
-
-def _sc_label(sc_no: int) -> str:
-    """Format scenario number as SC_001, SC_002, etc. to match template."""
-    return f"SC_{sc_no:03d}"
 
 
 # ─── REQUIREMENT 5: Column F content ─────────────────────────────────────────
@@ -698,6 +513,13 @@ def _col_e_test_details(tc: TestCase, siblings: Optional[List[TestCase]] = None)
             f"Confirms partial or sequenced changes in {sig} are handled correctly as the "
             f"system moves between states, with {out} reflecting the right state at each step.",
         ],
+        "invalid_input": [
+            f"Drives {sig} below its declared ICD minimum or above its declared ICD maximum "
+            f"and confirms the system detects the out-of-range value and rejects/clamps it "
+            f"per specification for {req}, without crashing or corrupting {out}.",
+            f"Exercises the ICD-declared invalid region for {sig}, checking that {req} is "
+            f"enforced against out-of-declared-range inputs rather than silently accepting them.",
+        ],
     }
 
     sc_type  = (tc.scenario_type or "").lower()
@@ -741,6 +563,9 @@ def _remarks_bullets(tc: TestCase) -> str:
         "boundary":   boundary_what,
         "edge":       "Edge case conditions tested (state transitions, simultaneous changes, unusual-but-valid states).",
         "robustness": "Invalid/out-of-range input values tested; system must respond safely without crash.",
+        "invalid_input": "Input parameter's declared valid range (per ICD/supporting-document cross-reference) "
+                          "is exercised at and beyond its boundaries, including below-minimum and above-maximum "
+                          "invalid values; system must detect and reject these safely.",
     }
     bullets.append(f"• What is tested: {sc_what.get(tc.scenario_type, 'Functional system behaviour verified.')}")
 
@@ -817,132 +642,49 @@ def _depends_on(raw_dep: str, tc_id: str, sc_no: int) -> str:
 
 # ─── HEADER WRITER ────────────────────────────────────────────────────────────
 
-def _write_headers(ws, input_signals: List[str], output_signals: List[str]) -> Dict[str, int]:
+STANDARD_TEMPLATE_COLUMNS: List[Tuple[str, int]] = [
+    ("Requirement_ID",              21),
+    ("TC_ID",                       16),
+    ("Test Objective",              20),
+    ("Test Details Description",    22),
+    ("Test Pre-Condition",          32),
+    ("Inputs",                      32),
+    ("Test Steps",                  30),
+    ("Requirement_Type",            14),
+    ("Coverage_Type",               14),
+    ("Test_Level",                  12),
+    ("Scenario_Type",               14),
+    ("Expected Outputs",            32),
+    ("Module",                       9),
+    ("Safety_Level",                10),
+    ("Priority",                     9),
+    ("PASS/FAIL Criteria",          40),
+    ("Configure_Baseline",          16),
+    ("Remarks",                     32),
+    ("Standard_Reference",          18),
+]
+
+
+def _write_headers(ws, input_signals: List[str] = None, output_signals: List[str] = None) -> Dict[str, int]:
     """
-    Writes rows 1 and 2 exactly matching One_TC_Updated.xlsx template.
-    Returns a dict of column-name -> column-index for use when writing data.
+    Writes the single-row standardized template header (19 mandatory
+    columns, fixed order — see STANDARD_TEMPLATE_COLUMNS). Returns a dict of
+    column-name -> column-index for use when writing data.
 
-    Template exact layout:
-      Col 1: Requirement_ID  (rows 1-2 merged)
-      Col 2: TC_ID           (rows 1-2 merged)
-      Col 3: Scenario No     (rows 1-2 merged)
-      Col 4: Test Objective  (rows 1-2 merged)
-      Col 5: Test Details Description  (rows 1-2 merged)
-      Col 6: Test Precondition         (rows 1-2 merged)
-      Col 7: Inputs          (row 1 merged across input signal sub-cols)
-        Col 7+0: signal_1 sub-header (row 2)
-        Col 7+1: signal_2 sub-header (row 2)
-        ...
-      Col 7+n_inputs: Test Steps       (rows 1-2 merged)
-      Col 7+n_inputs+1: Expected Outputs (row 1 merged across output sub-cols)
-        output signal sub-headers (row 2)  ← same treatment as input sub-headers
-      Col 7+n_inputs+1+n_outputs: Depends On   (rows 1-2 merged)  [sic]
-      Col ...: Test_Env       (rows 1-2 merged)
-      Col ...: Test_Type      (rows 1-2 merged)
-      Col ...: Scenario_Type  (rows 1-2 merged)
-      Col ...: Remarks/Additional information  (rows 1-2 merged)
-      Col ...: Module          (rows 1-2 merged)
+    `input_signals`/`output_signals` are accepted for call-site compatibility
+    but no longer produce sub-columns — Inputs and Expected Outputs are each
+    a single consolidated column now.
     """
-    n_in  = len(input_signals)
-    n_out = len(output_signals)
-
-    # Fixed prefix columns A-F
-    prefix = [
-        ("Requirement_ID",          21),
-        ("TC_ID",                    9),
-        ("Scenario No",             12),
-        ("Test Objective",          20),
-        ("Test Details Description",22),
-        ("Test Precondition",       45),
-    ]
-
-    col = 1
     col_map: Dict[str, int] = {}
-
-    # Write prefix headers (each spans rows 1-2)
-    for hdr, width in prefix:
+    for col, (hdr, width) in enumerate(STANDARD_TEMPLATE_COLUMNS, start=1):
         c = ws.cell(row=1, column=col, value=hdr)
         c.font = HEADER_FONT; c.fill = HEADER_FILL
         c.alignment = HEADER_ALIGN; c.border = THIN_BORDER
         ws.column_dimensions[get_column_letter(col)].width = width
-        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
         col_map[hdr] = col
-        col += 1
-
-    # "Inputs" group header at col G
-    inputs_start = col
-    col_map["Inputs_start"] = inputs_start
-    c = ws.cell(row=1, column=col, value="Inputs")
-    c.font = HEADER_FONT; c.fill = HEADER_FILL
-    c.alignment = HEADER_ALIGN; c.border = THIN_BORDER
-    if n_in > 1:
-        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + n_in - 1)
-    elif n_in == 0:
-        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
-
-    # Input signal sub-headers in row 2
-    for i, sig in enumerate(input_signals):
-        c2 = ws.cell(row=2, column=col + i, value=sig)
-        c2.font = SUBHDR_FONT; c2.fill = SUBHDR_FILL   # same blue (Req 6)
-        c2.alignment = SUBHDR_ALIGN; c2.border = THIN_BORDER
-        ws.column_dimensions[get_column_letter(col + i)].width = max(18, len(sig) + 4)
-        col_map[f"input_sig_{i}"] = col + i
-    col += max(n_in, 1)  # advance at least 1 column
-
-    # "Test Steps" standalone column
-    col_map["Test Steps"] = col
-    c = ws.cell(row=1, column=col, value="Test Steps")
-    c.font = HEADER_FONT; c.fill = HEADER_FILL
-    c.alignment = HEADER_ALIGN; c.border = THIN_BORDER
-    ws.column_dimensions[get_column_letter(col)].width = 30
-    ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
-    col += 1
-
-    # "Expected Outputs" group header
-    # Row 1: "Expected Outputs" merged across all output sub-columns (like "Inputs" group).
-    # Row 2: each output signal name as a sub-header (same blue style as input sub-headers).
-    # Data rows: each output signal gets its own sub-column containing ONLY the plain value.
-    outputs_start = col
-    col_map["Outputs_start"] = outputs_start
-    c = ws.cell(row=1, column=col, value="Expected Outputs")
-    c.font = HEADER_FONT; c.fill = HEADER_FILL
-    c.alignment = HEADER_ALIGN; c.border = THIN_BORDER
-    if n_out > 1:
-        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + n_out - 1)
-    elif n_out == 0:
-        # No output signals — merge row 1 and row 2 into a single cell
-        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
-
-    # Write output signal sub-headers in row 2 (identical treatment to input signals)
-    for i, sig in enumerate(output_signals):
-        c2 = ws.cell(row=2, column=col + i, value=sig)
-        c2.font = SUBHDR_FONT; c2.fill = SUBHDR_FILL
-        c2.alignment = SUBHDR_ALIGN; c2.border = THIN_BORDER
-        ws.column_dimensions[get_column_letter(col + i)].width = max(22, len(sig) + 4)
-        col_map[f"output_sig_{i}"] = col + i
-    col += max(n_out, 1)
-
-    # Suffix columns — all same blue header (Req 6)
-    suffix = [
-        ("Depends On",                      12),   # sic — typo preserved from template
-        ("Test_Env",                        12),
-        ("Test_Type",                       16),
-        ("Scenario_Type",                   14),
-        ("Remarks/Additional information",  32),
-        ("Module",                           9),
-    ]
-    for hdr, width in suffix:
-        c = ws.cell(row=1, column=col, value=hdr)
-        c.font = HEADER_FONT; c.fill = HEADER_FILL
-        c.alignment = HEADER_ALIGN; c.border = THIN_BORDER
-        ws.column_dimensions[get_column_letter(col)].width = width
-        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
-        col_map[hdr] = col
-        col += 1
 
     ws.row_dimensions[1].height = 28
-    ws.row_dimensions[2].height = 22
-    ws.freeze_panes = "A3"
+    ws.freeze_panes = "A2"
     return col_map
 
 
@@ -1004,7 +746,139 @@ def _extract_output_value_only(expected_outcome: str) -> str:
 # result to the payload; the frontend must read these fields directly rather
 # than recomputing them.
 
-def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] = None) -> dict:
+# ─── STANDARDIZED TEST CASE TEMPLATE — Columns 2/6/12/8/9/10/11/14/16/17/19 ───
+# Single source of truth for the 19-column standardized template so the GUI
+# table and the Excel export never drift, same pattern as the narrative
+# columns above.
+
+def _merged_tc_id(tc: TestCase) -> str:
+    """Column 2 — TC_ID: merges test_case_id + scenario_id into one field,
+    e.g. 'TC_001' + 'SC_001' -> 'TC_001_SC_001'. Falls back gracefully if
+    either half is missing so a partially-populated TC never renders blank."""
+    tc_id  = (tc.test_case_id or "").strip()
+    sc_id  = (tc.scenario_id  or "").strip()
+    if tc_id and sc_id:
+        return f"{tc_id}_{sc_id}" if not tc_id.endswith(sc_id) else tc_id
+    return tc_id or sc_id or ""
+
+
+def _consolidated_inputs(tc: TestCase) -> str:
+    """Column 6 — Inputs: consolidates every named input signal into ONE
+    field, 'Input1=Value1; Input2=Value2', instead of separate columns per
+    signal. Entries that aren't valid Name:Value/Name=Value pairs are kept
+    as-is so free-text inputs aren't silently dropped."""
+    if not tc.inputs:
+        return ""
+    parts = []
+    for entry in tc.inputs:
+        name, value = _parse_signal_value(entry)
+        if name and value:
+            parts.append(f"{name}={value}")
+        elif entry:
+            parts.append(str(entry).strip())
+    return "; ".join(p for p in parts if p)
+
+
+def _consolidated_outputs(tc: TestCase) -> str:
+    """Column 12 — Expected Outputs: consolidates every named output signal
+    into ONE field, 'Output1=ExpectedValue1; Output2=ExpectedValue2', instead
+    of separate columns per signal. Falls back to the first-sentence summary
+    when no named signal=value pairs can be parsed out of expected_outcome."""
+    input_names = set()
+    for entry in tc.inputs:
+        n, _ = _parse_signal_value(entry)
+        if n:
+            input_names.add(_normalise_signal_name(n))
+    pairs = _extract_all_output_signals_with_values(tc.expected_outcome, exclude_names=input_names)
+    if pairs:
+        return "; ".join(f"{name}={value}" for name, value in pairs)
+    fallback = _extract_output_value_only(tc.expected_outcome) or (tc.expected_outcome or "").split(".")[0].strip()
+    return fallback
+
+
+def _requirement_type_display(tc: TestCase) -> str:
+    """Column 8 — Requirement_Type: 'Functional' / 'Non-Functional'."""
+    return "Non-Functional" if (tc.requirement_type or "").lower().startswith("non") else "Functional"
+
+
+def _coverage_type_display(tc: TestCase) -> str:
+    """Column 9 — Coverage_Type: 'Validation' / 'Verification' / 'Integration',
+    mapped 1:1 from the existing testing_type field (no new classification)."""
+    mapping = {"verification": "Verification", "validation": "Validation", "integration": "Integration"}
+    return mapping.get((tc.testing_type or "").lower(), "Verification")
+
+def _test_level_display(tc: TestCase, domain: str) -> str:
+    """Column 10 — Test_Level: Unit / Integration / System.
+    Per-TC override (tc.test_level, settable by the MCP/Claude-AI path)
+    wins; otherwise the session-level domain default applies, promoted to
+    'Integration' whenever Coverage_Type is Integration."""
+    if tc.test_level:
+        return tc.test_level
+    if _coverage_type_display(tc) == "Integration":
+        return TEST_LEVEL_INTEGRATION_OVERRIDE
+    return DOMAIN_DEFAULTS.get(domain, DOMAIN_DEFAULTS["general"])["test_level"]
+
+
+def _scenario_type_display(tc: TestCase) -> str:
+    """Column 11 — Scenario_Type. Passed through as-is (title-cased) rather
+    than collapsed into a smaller enum — Transition/Fault/Timing/Invalid_Input
+    scenarios keep their real classification per Hari's decision to preserve
+    existing generation logic rather than lose scenario-type fidelity."""
+    raw = (tc.scenario_type or "normal").replace("_", " ")
+    return "".join(w.capitalize() for w in raw.split())
+
+
+def _safety_level_display(tc: TestCase, domain: str) -> str:
+    """Column 14 — Safety_Level: High / Low.
+    Per-TC override wins (MCP/Claude-AI path, which can reason about DAL/
+    ASIL from the SRS); otherwise the session-level domain default applies.
+    This is a starting point for review, not an authoritative DAL/ASIL
+    classification — the tool does not track per-requirement DAL/ASIL."""
+    if tc.safety_level:
+        return tc.safety_level
+    return DOMAIN_DEFAULTS.get(domain, DOMAIN_DEFAULTS["general"])["safety_level"]
+
+
+def _standard_reference_display(tc: TestCase, domain: str) -> str:
+    """Column 19 — Standard_Reference: document name(s) for the domain.
+    Per-TC override wins (MCP/Claude-AI path, which cites the specific
+    clause via the domain pack in general-tc-skill); otherwise the
+    session-level domain default document name applies."""
+    if tc.standard_reference:
+        return tc.standard_reference
+    return DOMAIN_DEFAULTS.get(domain, DOMAIN_DEFAULTS["general"])["standard_reference"]
+
+
+def _pass_fail_criteria(tc: TestCase, outputs_display: str) -> str:
+    """Column 16 — PASS/FAIL Criteria, derived from the same expected-output
+    text as column 12 so the two never contradict each other."""
+    expected = outputs_display or "expected result as specified"
+    return f"PASS: Actual result matches {expected}. FAIL: Any deviation from the expected result."
+
+
+def compute_standard_template_fields(tc: TestCase, domain: str = "general") -> dict:
+    """Computes the standardized 19-column template's derived/consolidated
+    fields (columns not already covered by compute_gui_display_fields) as a
+    flat dict, ready to attach to a TestCase for both the GUI table and the
+    Excel export."""
+    outputs_display = _consolidated_outputs(tc)
+    return {
+        "tc_id_display":              _merged_tc_id(tc),
+        "inputs_display":             _consolidated_inputs(tc),
+        "outputs_display":            outputs_display,
+        "requirement_type_display":   _requirement_type_display(tc),
+        "coverage_type_display":      _coverage_type_display(tc),
+        "test_level_display":         _test_level_display(tc, domain),
+        "scenario_type_display":      _scenario_type_display(tc),
+        "safety_level_display":       _safety_level_display(tc, domain),
+        "pass_fail_criteria":         _pass_fail_criteria(tc, outputs_display),
+        "configure_baseline":         "",   # Req: keep blank for now
+        "standard_reference_display": _standard_reference_display(tc, domain),
+    }
+
+
+def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] = None,
+                                domain: str = "general") -> dict:
     """Computes the same derived columns used in generate_excel/generate_docx
     and returns them as a flat dict of field_name -> display string, ready to
     be attached to the TestCase (or the raw dict backing it) before it is
@@ -1013,6 +887,9 @@ def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] 
     `siblings` should be every other TestCase sharing this batch (ideally at
     least everything sharing this TC_ID) so that MC/DC boundary rows can
     identify the actually-varied signal — see _description_signal_names.
+
+    `domain` selects the Safety_Level / Test_Level / Standard_Reference
+    defaults from constants.DOMAIN_DEFAULTS (see GenerateRequest.domain).
     """
     sc_lbl = (tc.scenario_id or "").strip()
     try:
@@ -1024,7 +901,7 @@ def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] 
     if not expected_first_sentence and tc.expected_outcome:
         expected_first_sentence = tc.expected_outcome.split(".")[0].strip()
 
-    return {
+    fields = {
         "test_details_description":  _col_e_test_details(tc, siblings=siblings),
         "test_precondition_display": _col_f_precondition(tc, []),
         "expected_outputs_display":  expected_first_sentence,
@@ -1032,28 +909,26 @@ def compute_gui_display_fields(tc: TestCase, siblings: Optional[List[TestCase]] 
         "remarks_display":           _remarks_bullets(tc),
         "module_display":            _module_alpha_only(tc.module),
     }
+    fields.update(compute_standard_template_fields(tc, domain=domain))
+    return fields
 
 
 # ─── STANDALONE ROW WRITER ────────────────────────────────────────────────────
 
 def _write_tc_row(ws, row_idx: int, tc: TestCase,
-                  col_map: dict, in_sigs: List[str], out_sigs: List[str],
-                  signal_defaults: dict = None, siblings: Optional[List[TestCase]] = None) -> None:
+                  col_map: dict, in_sigs: List[str] = None, out_sigs: List[str] = None,
+                  signal_defaults: dict = None, siblings: Optional[List[TestCase]] = None,
+                  domain: str = "general") -> None:
     """
-    Writes one TC row into worksheet ws at row_idx.
+    Writes one TC row into worksheet ws at row_idx using the standardized
+    19-column template. Inputs and Expected Outputs are each written as a
+    single consolidated "Name1=Value1; Name2=Value2" cell (no per-signal
+    sub-columns) per the standardized template spec.
 
-    One row = one test case.  Each input signal is written independently into
-    its own sub-column (never combined with other signals).  The signal name is
-    the sub-column header; the cell receives only the plain value for that TC.
-
-    For TCs that have no named-signal inputs (generic template strings), the
-    combined inputs text falls back to the first sub-column so the row is never
-    left completely blank.
+    `in_sigs`/`out_sigs`/`signal_defaults` are accepted for call-site
+    compatibility but no longer drive column layout.
     """
     is_alt = (row_idx % 2 == 0)
-    tc_id  = tc.test_case_id
-    sc_lbl = tc.scenario_id
-    sc_no  = int(sc_lbl.replace("SC_", "")) if sc_lbl.startswith("SC_") else row_idx - 2
 
     def _p(col: int, value, center: bool = False):
         cell = ws.cell(row=row_idx, column=col, value=value)
@@ -1063,55 +938,30 @@ def _write_tc_row(ws, row_idx: int, tc: TestCase,
         if is_alt:
             cell.fill  = ALT_FILL
 
-    # ── Fixed columns ──────────────────────────────────────────────────────────
-    _p(col_map["Requirement_ID"],          tc.traceability_req_id)
-    _p(col_map["TC_ID"],                   tc_id)
-    _p(col_map["Scenario No"],             sc_lbl)
-    _p(col_map["Test Objective"],          tc.objective)
-    _p(col_map["Test Details Description"], _col_e_test_details(tc, siblings=siblings))
-    _p(col_map["Test Precondition"],        _col_f_precondition(tc, in_sigs))
+    fields = compute_standard_template_fields(tc, domain=domain)
+    test_details = _col_e_test_details(tc, siblings=siblings)
+    precondition = _col_f_precondition(tc, [])
+    remarks      = _remarks_bullets(tc)
 
-    # ── Input sub-columns ──────────────────────────────────────────────────────
-    # Each named signal gets its own dedicated column.
-    # _get_signal_value looks up the value for that signal name from tc.inputs.
-    # This guarantees every input is handled independently — no merging of
-    # signal names with their values into a single combined cell.
-    if in_sigs:
-        sig_values = [_get_signal_value(tc, sig, "input") for sig in in_sigs]
-        if any(sig_values):
-            # Named signals matched — write each value into its own sub-column.
-            # If a signal is missing, inherit from the normal-scenario default.
-            for idx_i, (sig, val) in enumerate(zip(in_sigs, sig_values)):
-                if not val and signal_defaults:
-                    val = signal_defaults.get(sig.lower(), "")
-                _p(col_map["Inputs_start"] + idx_i, val, center=True)
-        else:
-            # No named signal matched for this TC (generic template row).
-            # Write combined inputs text in the first sub-column only.
-            _p(col_map["Inputs_start"], _list_to_str(tc.inputs))
-    else:
-        # No named signals on this sheet — write combined text to single cell.
-        _p(col_map["Inputs_start"], _list_to_str(tc.inputs))
-
-    # ── Test Steps ─────────────────────────────────────────────────────────────
-    _p(col_map["Test Steps"], _list_to_str(tc.test_steps))
-
-    # ── Output sub-columns ─────────────────────────────────────────────────────
-    if out_sigs:
-        for idx_o, sig in enumerate(out_sigs):
-            val = _get_signal_value(tc, sig, "output")
-            _p(col_map["Outputs_start"] + idx_o, val, center=True)
-    else:
-        _p(col_map["Outputs_start"], _extract_output_value_only(tc.expected_outcome), center=True)
-
-    # ── Suffix columns ─────────────────────────────────────────────────────────
-    _p(col_map["Depends On"],
-       _depends_on(tc.dependent_test_cases, tc_id, sc_no))
-    _p(col_map["Test_Env"],      tc.test_environment)
-    _p(col_map["Test_Type"],     tc.testing_type)
-    _p(col_map["Scenario_Type"], tc.scenario_type)
-    _p(col_map["Remarks/Additional information"], _remarks_bullets(tc))
-    _p(col_map["Module"],        _module_alpha_only(tc.module))
+    _p(col_map["Requirement_ID"],           tc.traceability_req_id)
+    _p(col_map["TC_ID"],                    fields["tc_id_display"])
+    _p(col_map["Test Objective"],           tc.objective)
+    _p(col_map["Test Details Description"], test_details)
+    _p(col_map["Test Pre-Condition"],       precondition)
+    _p(col_map["Inputs"],                   fields["inputs_display"] or "N/A — see Test Steps")
+    _p(col_map["Test Steps"],               _list_to_str(tc.test_steps))
+    _p(col_map["Requirement_Type"],         fields["requirement_type_display"], center=True)
+    _p(col_map["Coverage_Type"],            fields["coverage_type_display"], center=True)
+    _p(col_map["Test_Level"],               fields["test_level_display"], center=True)
+    _p(col_map["Scenario_Type"],            fields["scenario_type_display"], center=True)
+    _p(col_map["Expected Outputs"],         fields["outputs_display"] or "N/A")
+    _p(col_map["Module"],                   _module_alpha_only(tc.module), center=True)
+    _p(col_map["Safety_Level"],             fields["safety_level_display"], center=True)
+    _p(col_map["Priority"],                 tc.priority, center=True)
+    _p(col_map["PASS/FAIL Criteria"],       fields["pass_fail_criteria"])
+    _p(col_map["Configure_Baseline"],       fields["configure_baseline"])
+    _p(col_map["Remarks"],                  remarks)
+    _p(col_map["Standard_Reference"],       fields["standard_reference_display"], center=True)
 
 
 # ─── SAFE SHEET NAME ───────────────────────────────────────────────────────────
@@ -1133,35 +983,13 @@ def _safe_sheet_name(req_id: str, used: set) -> str:
 
 # ─── EXCEL EXPORT ─────────────────────────────────────────────────────────────
 
-def _build_signal_defaults(tcs: list) -> dict:
+def generate_excel(test_cases: List[TestCase], removed_count: int, domain: str = "general") -> bytes:
     """
-    From the normal scenario (SC_001) for a requirement, build a dict of
-    {signal_name_lower: value} used as fallback when other scenarios omit
-    a signal that is not being varied.
-    """
-    if not tcs:
-        return {}
-    normal = next((t for t in tcs if t.scenario_type == "normal"), tcs[0])
-    defaults = {}
-    for entry in normal.inputs:
-        name, value = _parse_signal_value(entry)
-        if name:
-            defaults[name.lower()] = value
-    return defaults
-
-
-def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
-    """
-    Generate Excel matching One_TC_Updated.xlsx template exactly.
-    All requirements applied:
-      Req 3:  TC_ID same for all scenarios of one req; SC resets per req
-      Req 4:  Input source (SRS/ICD) recorded in Remarks
-      Req 5:  Col F = Test Objective + input-related Test Steps
-      Req 6:  Uniform blue header colour throughout
-      Req 7:  Module = alpha-only
-      Req 8:  Remarks = bullet format, no test-basis, SC description
-      Req 9:  Precondition includes pre-set values + output-influence note
-      Req 10: Depends On = TC_ID + SC_NNN
+    Generate Excel using the standardized 19-column Test Case Template
+    (see module docstring / STANDARD_TEMPLATE_COLUMNS). Each requirement
+    still gets its own sheet; `domain` selects the Safety_Level/Test_Level/
+    Standard_Reference defaults (see constants.DOMAIN_DEFAULTS) for any TC
+    that doesn't carry a per-TC override.
     """
     wb = openpyxl.Workbook()
     # Remove the default empty sheet created by openpyxl — we do NOT want a
@@ -1227,15 +1055,11 @@ def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
         sname    = _safe_sheet_name(req_id, used_names)
         used_names.add(sname)
         ws_r     = wb.create_sheet(title=sname)
+        r_cmap   = _write_headers(ws_r)
 
-        # Each requirement sheet uses ONLY its own signal columns
-        r_in, r_out = extract_signal_columns(req_tcs)
-        r_cmap      = _write_headers(ws_r, r_in, r_out)
-
-        for row_idx, tc in enumerate(req_tcs, start=3):
-            _write_tc_row(ws_r, row_idx, tc, r_cmap, r_in, r_out,
-                          signal_defaults=_build_signal_defaults(req_tcs),
-                          siblings=req_tcs)
+        for row_idx, tc in enumerate(req_tcs, start=2):
+            _write_tc_row(ws_r, row_idx, tc, r_cmap,
+                          siblings=req_tcs, domain=domain)
 
     # Summary sheet always last
     wb.move_sheet("Summary", offset=len(wb.worksheets) - 1)
@@ -1247,7 +1071,7 @@ def generate_excel(test_cases: List[TestCase], removed_count: int) -> bytes:
 
 # ─── WORD EXPORT ──────────────────────────────────────────────────────────────
 
-def generate_docx(test_cases: List[TestCase], removed_count: int) -> bytes:
+def generate_docx(test_cases: List[TestCase], removed_count: int, domain: str = "general") -> bytes:
     doc = DocxDocument()
     for section in doc.sections:
         section.top_margin = section.bottom_margin = Inches(0.8)
@@ -1272,37 +1096,37 @@ def generate_docx(test_cases: List[TestCase], removed_count: int) -> bytes:
     for tc in test_cases:
         by_module[_module_alpha_only(tc.module)].append(tc)
 
-    input_signals, output_signals = extract_signal_columns(test_cases)
-
     for module in sorted(by_module.keys()):
         h = doc.add_paragraph(f"Module: {module}")
         h.style = "Heading 1"
 
         for tc in by_module[module]:
+            fields = compute_standard_template_fields(tc, domain=domain)
             req_id = tc.traceability_req_id
-            tc_id  = tc.test_case_id
-            sc_lbl = tc.scenario_id
-            sc_no  = int(sc_lbl.replace("SC_", "")) if sc_lbl.startswith("SC_") else 1
 
-            sub = doc.add_paragraph(f"{tc_id} | {sc_lbl} | {tc.scenario_type.capitalize()}")
+            sub = doc.add_paragraph(f"{fields['tc_id_display']} | {fields['scenario_type_display']}")
             sub.style = "Heading 2"
 
             rows = [
                 ("Requirement_ID",          req_id),
-                ("TC_ID",                   tc_id),
-                ("Scenario No",             sc_lbl),
+                ("TC_ID",                   fields["tc_id_display"]),
                 ("Test Objective",          tc.objective),
                 ("Test Details Description", _col_e_test_details(tc, siblings=by_module[module])),
-                ("Test Precondition",       _col_f_precondition(tc, input_signals)),
-                ("Inputs",                  _list_to_str(tc.inputs)),
+                ("Test Pre-Condition",      _col_f_precondition(tc, [])),
+                ("Inputs",                  fields["inputs_display"]),
                 ("Test Steps",              _list_to_str(tc.test_steps)),
-                ("Expected Outputs",        tc.expected_outcome),
-                ("Depends On",              _depends_on(tc.dependent_test_cases, tc_id, sc_no)),
-                ("Test_Env",                tc.test_environment),
-                ("Test_Type",               tc.testing_type),
-                ("Scenario_Type",           tc.scenario_type),
-                ("Remarks",                 _remarks_bullets(tc)),
+                ("Requirement_Type",        fields["requirement_type_display"]),
+                ("Coverage_Type",           fields["coverage_type_display"]),
+                ("Test_Level",              fields["test_level_display"]),
+                ("Scenario_Type",           fields["scenario_type_display"]),
+                ("Expected Outputs",        fields["outputs_display"]),
                 ("Module",                  _module_alpha_only(tc.module)),
+                ("Safety_Level",            fields["safety_level_display"]),
+                ("Priority",                tc.priority),
+                ("PASS/FAIL Criteria",      fields["pass_fail_criteria"]),
+                ("Configure_Baseline",      fields["configure_baseline"]),
+                ("Remarks",                 _remarks_bullets(tc)),
+                ("Standard_Reference",      fields["standard_reference_display"]),
             ]
 
             table = doc.add_table(rows=len(rows), cols=2)
